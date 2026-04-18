@@ -685,6 +685,16 @@ class ScribeApp(rumps.App):
 
         self.recorder = Recorder()
         self.recording = False
+        # _opening: a background thread is inside sd.InputStream(...).start(),
+        # which calls PortAudio's Pa_OpenStream. That call can block forever
+        # on macOS if the audio device was just yanked (AirPods/USB mic swap)
+        # or CoreAudio is in a bad state. We MUST NOT run it on the main
+        # thread — doing so freezes the whole menubar UI with no way out.
+        # _pending_stop: user released the hotkey before the stream finished
+        # opening. When the open completes we should immediately tear it down
+        # instead of recording.
+        self._opening = False
+        self._pending_stop = False
         self._rec_lock = threading.Lock()
         self._lang = "en"  # default transcription language
 
@@ -1014,25 +1024,77 @@ class ScribeApp(rumps.App):
             callAfter(self._stop_recording)
 
     def _start_recording(self) -> None:
+        # Main thread. Must return FAST — never call Pa_OpenStream here.
         with self._rec_lock:
-            if self.recording:
+            if self.recording or self._opening:
                 return
-            try:
-                self.recorder.start()
-                self.recording = True
-                self.title = ScribeApp.REC_TITLE
-                hk_label = HOTKEYS[self.hotkey_id][2]
-                self.status_item.title = f"Listening… release {hk_label} to paste"
-            except Exception as exc:
-                print(f"[rec start] {exc}", file=sys.stderr)
-                rumps.notification(
-                    "Microphone error",
-                    "",
+            self._opening = True
+            self._pending_stop = False
+        self.title = ScribeApp.REC_TITLE
+        hk_label = HOTKEYS[self.hotkey_id][2]
+        self.status_item.title = f"Listening… release {hk_label} to paste"
+        threading.Thread(target=self._open_stream_worker, daemon=True).start()
+
+    def _open_stream_worker(self) -> None:
+        """
+        Opens the audio stream off the main thread. Pa_OpenStream can hang
+        indefinitely if the audio device is misbehaving; we surface a
+        notification if it takes too long so the user knows the app isn't
+        frozen and can fix their audio setup.
+        """
+        opened = threading.Event()
+
+        def _watchdog() -> None:
+            if not opened.wait(5.0):
+                callAfter(lambda: rumps.notification(
+                    "Scribe: mic not responding",
+                    "Audio device is stuck",
+                    "Try toggling your input device (unplug/replug, or switch "
+                    "in System Settings → Sound → Input).",
+                ))
+        threading.Thread(target=_watchdog, daemon=True).start()
+
+        err: Exception | None = None
+        try:
+            self.recorder.start()
+        except Exception as exc:
+            err = exc
+            print(f"[rec start] {exc}", file=sys.stderr)
+        opened.set()
+
+        with self._rec_lock:
+            self._opening = False
+            if err is not None:
+                self._pending_stop = False
+                callAfter(lambda: rumps.notification(
+                    "Microphone error", "", str(err)[:180] or
                     "Allow microphone access to Scribe in System Settings.",
-                )
+                ))
+                callAfter(lambda: self._back_to_idle("Mic error"))
+                return
+            if self._pending_stop:
+                # User let go of the hotkey before the stream finished
+                # opening — tear it down silently and bail.
+                self._pending_stop = False
+                threading.Thread(target=self._discard_stream, daemon=True).start()
+                callAfter(lambda: self._back_to_idle("Too short — ignored"))
+                return
+            self.recording = True
+
+    def _discard_stream(self) -> None:
+        """Close a stream we no longer want, without transcribing."""
+        try:
+            self.recorder.stop()
+        except Exception as exc:
+            print(f"[rec discard] {exc}", file=sys.stderr)
 
     def _stop_recording(self) -> None:
         with self._rec_lock:
+            if self._opening:
+                # Stream hasn't finished opening yet. Mark for cancellation;
+                # the opener thread will tear it down when it completes.
+                self._pending_stop = True
+                return
             if not self.recording:
                 return
             self.recording = False
