@@ -1,0 +1,8 @@
+# Scribe — macOS-only dependencies.
+# Install alongside requirements.txt:
+#   pip install -r requirements.txt -r requirements-mac.txt
+
+rumps>=0.4.0
+pyobjc-framework-Cocoa>=10
+pyobjc-framework-Quartz>=10
+pyobjc-framework-ApplicationServices>=10

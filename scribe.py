@@ -39,7 +39,6 @@ from __future__ import annotations
 from AppKit import NSBundle
 NSBundle.mainBundle().infoDictionary()["LSUIElement"] = "1"
 
-import io
 import json
 import os
 import subprocess
@@ -47,14 +46,36 @@ import sys
 import threading
 import time
 import uuid
-import wave
-from datetime import datetime
 from pathlib import Path
 
 import rumps
-import numpy as np
-import sounddevice as sd
-import httpx
+
+from scribe_core import (
+    APP_NAME,
+    APP_DIR,
+    DOTENV_FILE,
+    CONFIG_DIR,
+    HISTORY_FILE,
+    CONFIG_FILE,
+    SPEAK_SELECTION_DIR,
+    VOICE_CONFIG_FILE,
+    SETTINGS_FILE,
+    VOICES,
+    DEFAULT_VOICE,
+    Recorder,
+    load_dotenv as _load_dotenv,
+    append_history,
+    load_history,
+    clear_history,
+    load_cfg,
+    save_cfg,
+    groq_api_key,
+    save_groq_key_to_dotenv,
+    load_voice,
+    save_voice,
+    transcribe,
+    is_garbage,
+)
 
 from AppKit import (
     NSApp,
@@ -91,91 +112,9 @@ from Quartz import (
 )
 
 
-# ---------- paths / config ------------------------------------------------
-
-APP_NAME = "scribe"
-APP_DIR = Path(__file__).resolve().parent
-DOTENV_FILE = APP_DIR / ".env"
-CONFIG_DIR = Path.home() / ".config" / APP_NAME
-CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-HISTORY_FILE = CONFIG_DIR / "history.jsonl"
-CONFIG_FILE = CONFIG_DIR / "config.json"
-
-
-def _load_dotenv(path: Path) -> None:
-    """Minimal .env loader — no extra dependency. Existing env wins."""
-    if not path.exists():
-        return
-    try:
-        for line in path.read_text().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, _, v = line.partition("=")
-            k = k.strip()
-            v = v.strip()
-            if (v.startswith('"') and v.endswith('"')) or (
-                v.startswith("'") and v.endswith("'")
-            ):
-                v = v[1:-1]
-            if k and k not in os.environ:
-                os.environ[k] = v
-    except Exception as exc:
-        print(f"[.env] load error: {exc}", file=sys.stderr)
-
-
+# Load .env from the app directory so GROQ_API_KEY is available before any
+# call into scribe_core.groq_api_key().
 _load_dotenv(DOTENV_FILE)
-
-# Shared voice config, same path v1 used — so any external tool that already
-# reads it (e.g. a "Speak Selection" hotkey) keeps working with v2.
-SPEAK_SELECTION_DIR = Path.home() / ".config" / "speak-selection"
-SPEAK_SELECTION_DIR.mkdir(parents=True, exist_ok=True)
-VOICE_CONFIG_FILE = SPEAK_SELECTION_DIR / "config"
-SETTINGS_FILE = SPEAK_SELECTION_DIR / "settings.json"
-
-
-# ---------- voices --------------------------------------------------------
-# A curated subset of Microsoft's Edge neural voices. All free, no key.
-VOICES = {
-    "English (US)": [
-        ("Ava · warm, expressive",         "en-US-AvaMultilingualNeural"),
-        ("Andrew · natural male",          "en-US-AndrewMultilingualNeural"),
-        ("Emma · friendly female",         "en-US-EmmaMultilingualNeural"),
-        ("Brian · clear male",             "en-US-BrianMultilingualNeural"),
-        ("Aria · news anchor",             "en-US-AriaNeural"),
-        ("Jenny · casual female",          "en-US-JennyNeural"),
-        ("Guy · confident male",           "en-US-GuyNeural"),
-    ],
-    "English (UK)":  [
-        ("Sonia · UK female",              "en-GB-SoniaNeural"),
-        ("Ryan · UK male",                 "en-GB-RyanNeural"),
-    ],
-    "English (AU)":  [
-        # Microsoft does not ship an `en-US-William`. William is AU-only.
-        ("William · AU male",              "en-AU-WilliamNeural"),
-        ("Natasha · AU female",            "en-AU-NatashaNeural"),
-    ],
-    "French":        [
-        ("Denise · France female",         "fr-FR-DeniseNeural"),
-        ("Henri · France male",            "fr-FR-HenriNeural"),
-        ("Vivienne · FR multilingual",     "fr-FR-VivienneMultilingualNeural"),
-        ("Remy · FR multilingual",         "fr-FR-RemyMultilingualNeural"),
-    ],
-    "Spanish":       [
-        ("Elvira · ES female",             "es-ES-ElviraNeural"),
-        ("Alvaro · ES male",               "es-ES-AlvaroNeural"),
-    ],
-    "German":        [
-        ("Katja · DE female",              "de-DE-KatjaNeural"),
-        ("Conrad · DE male",               "de-DE-ConradNeural"),
-    ],
-    "Italian":       [
-        ("Elsa · IT female",               "it-IT-ElsaNeural"),
-        ("Diego · IT male",                "it-IT-DiegoNeural"),
-    ],
-}
-
-DEFAULT_VOICE = "en-US-AvaMultilingualNeural"
 
 
 # ---------- helpers: foreground activation --------------------------------
@@ -295,238 +234,6 @@ def paste_text(text: str) -> None:
         except Exception as exc:
             # Never let clipboard-restore failure break dictation.
             print(f"[pasteboard] restore failed: {exc}", file=sys.stderr)
-
-
-# ---------- helpers: history ----------------------------------------------
-
-def append_history(text: str, duration_ms: int) -> None:
-    row = {
-        "ts": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-        "text": text,
-        "duration_ms": duration_ms,
-    }
-    with HISTORY_FILE.open("a") as f:
-        f.write(json.dumps(row, ensure_ascii=False) + "\n")
-
-
-def load_history(limit: int = 50) -> list[dict]:
-    if not HISTORY_FILE.exists():
-        return []
-    rows: list[dict] = []
-    with HISTORY_FILE.open("r") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rows.append(json.loads(line))
-            except Exception:
-                pass
-    return rows[-limit:][::-1]  # newest first
-
-
-def clear_history() -> None:
-    if HISTORY_FILE.exists():
-        HISTORY_FILE.unlink()
-
-
-# ---------- helpers: config & API key -------------------------------------
-
-def load_cfg() -> dict:
-    if CONFIG_FILE.exists():
-        try:
-            return json.loads(CONFIG_FILE.read_text())
-        except Exception:
-            return {}
-    return {}
-
-
-def save_cfg(cfg: dict) -> None:
-    CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
-
-
-def groq_api_key() -> str:
-    k = (os.environ.get("GROQ_API_KEY") or "").strip()
-    if k:
-        return k
-    cfg = load_cfg()
-    return str(cfg.get("groq_api_key", "")).strip()
-
-
-def save_groq_key_to_dotenv(key: str) -> None:
-    """Upsert GROQ_API_KEY into the app's .env file with 0600 perms."""
-    key = key.strip()
-    existing: list[str] = []
-    if DOTENV_FILE.exists():
-        existing = DOTENV_FILE.read_text().splitlines()
-    out: list[str] = []
-    replaced = False
-    for line in existing:
-        if line.strip().startswith("GROQ_API_KEY="):
-            out.append(f"GROQ_API_KEY={key}")
-            replaced = True
-        else:
-            out.append(line)
-    if not replaced:
-        out.append(f"GROQ_API_KEY={key}")
-    DOTENV_FILE.write_text("\n".join(out) + "\n")
-    try:
-        os.chmod(DOTENV_FILE, 0o600)
-    except Exception:
-        pass
-
-
-# ---------- TTS voice config (shared with v1's speak-selection) -----------
-
-def _parse_shell_kv(text: str) -> dict[str, str]:
-    """v1 writes shell-style KEY=\"VALUE\" lines. Parse that."""
-    out: dict[str, str] = {}
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, _, v = line.partition("=")
-        v = v.strip()
-        if (v.startswith('"') and v.endswith('"')) or (
-            v.startswith("'") and v.endswith("'")
-        ):
-            v = v[1:-1]
-        out[k.strip()] = v
-    return out
-
-
-def load_voice() -> str:
-    try:
-        if VOICE_CONFIG_FILE.exists():
-            raw = VOICE_CONFIG_FILE.read_text()
-            kv = _parse_shell_kv(raw)
-            v = kv.get("VOICE") or raw.strip()
-            return v or DEFAULT_VOICE
-    except Exception:
-        pass
-    return DEFAULT_VOICE
-
-
-def save_voice(voice: str) -> None:
-    """Write shell-sourceable config that is compatible with whatever tool
-    already reads VOICE/RATE/PITCH from this file."""
-    kv: dict[str, str] = {"RATE": "+0%", "PITCH": "+0Hz"}
-    if VOICE_CONFIG_FILE.exists():
-        try:
-            kv.update(_parse_shell_kv(VOICE_CONFIG_FILE.read_text()))
-        except Exception:
-            pass
-    kv["VOICE"] = voice
-    out = "\n".join(f'{k}="{v}"' for k, v in kv.items()) + "\n"
-    VOICE_CONFIG_FILE.write_text(out)
-
-    settings = {}
-    if SETTINGS_FILE.exists():
-        try:
-            settings = json.loads(SETTINGS_FILE.read_text())
-        except Exception:
-            settings = {}
-    settings["voice"] = voice
-    SETTINGS_FILE.write_text(json.dumps(settings, indent=2))
-
-
-# ---------- audio recorder ------------------------------------------------
-
-class Recorder:
-    """Simple in-memory recorder using sounddevice. Mono, 16 kHz, int16."""
-
-    SAMPLE_RATE = 16000
-
-    def __init__(self) -> None:
-        self._chunks: list[np.ndarray] = []
-        self._stream: sd.InputStream | None = None
-        self._started_at: float = 0.0
-
-    def start(self) -> None:
-        self._chunks = []
-        self._started_at = time.time()
-
-        def cb(indata, frames, t, status):  # noqa: ANN001
-            if status:
-                # under/overflow — log but keep recording
-                pass
-            self._chunks.append(indata.copy())
-
-        self._stream = sd.InputStream(
-            samplerate=self.SAMPLE_RATE,
-            channels=1,
-            dtype="int16",
-            blocksize=0,
-            callback=cb,
-        )
-        self._stream.start()
-
-    def stop(self) -> tuple[bytes, int]:
-        """Returns (wav_bytes, duration_ms). Empty bytes if nothing captured."""
-        duration_ms = int((time.time() - self._started_at) * 1000)
-        if self._stream is not None:
-            try:
-                self._stream.stop()
-                self._stream.close()
-            except Exception:
-                pass
-            self._stream = None
-        if not self._chunks:
-            return b"", duration_ms
-
-        data = np.concatenate(self._chunks, axis=0)
-        buf = io.BytesIO()
-        with wave.open(buf, "wb") as w:
-            w.setnchannels(1)
-            w.setsampwidth(2)
-            w.setframerate(self.SAMPLE_RATE)
-            w.writeframes(data.tobytes())
-        return buf.getvalue(), duration_ms
-
-
-# ---------- Whisper STT via Groq ------------------------------------------
-
-GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
-STT_MODEL = "whisper-large-v3-turbo"
-
-
-def transcribe(wav_bytes: bytes, language: str = "en") -> str:
-    key = groq_api_key()
-    if not key:
-        return ""
-    if not wav_bytes:
-        return ""
-    try:
-        with httpx.Client(timeout=30.0) as c:
-            r = c.post(
-                GROQ_URL,
-                headers={"Authorization": f"Bearer {key}"},
-                files={"file": ("rec.wav", wav_bytes, "audio/wav")},
-                data={
-                    "model": STT_MODEL,
-                    "language": language,
-                    "response_format": "json",
-                    "temperature": "0",
-                },
-            )
-            r.raise_for_status()
-            return (r.json().get("text") or "").strip()
-    except Exception as exc:
-        print(f"[stt] {exc}", file=sys.stderr)
-        return ""
-
-
-# Whisper is famous for hallucinating these on silent / noisy clips.
-_JUNK = {
-    "you", "thanks", "thankyou", "bye", "okay", "ok",
-    "thanksforwatching", "subscribe", "thanksforwatchingthevideo",
-    "pleasesubscribe", "music",
-}
-
-
-def is_garbage(text: str) -> bool:
-    norm = "".join(ch for ch in text.lower() if ch.isalpha())
-    return len(norm) < 2 or norm in _JUNK
 
 
 # ---------- Hotkey watcher (runs on a background thread) ------------------

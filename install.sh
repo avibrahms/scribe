@@ -40,7 +40,10 @@ if [[ ! -x "$REPO_DIR/venv/bin/python" ]]; then
 fi
 echo "==> installing dependencies"
 "$REPO_DIR/venv/bin/pip" install --upgrade pip >/dev/null
-"$REPO_DIR/venv/bin/pip" install -r "$REPO_DIR/requirements.txt" py2app
+"$REPO_DIR/venv/bin/pip" install \
+    -r "$REPO_DIR/requirements.txt" \
+    -r "$REPO_DIR/requirements-mac.txt" \
+    py2app
 
 # --- 3. Groq API key ----------------------------------------------------
 
