@@ -390,7 +390,11 @@ class ScribeApp(rumps.App):
     def __init__(self) -> None:
         super().__init__(ScribeApp.IDLE_TITLE, quit_button=None)
 
-        self.recorder = Recorder()
+        # One Recorder instance per recording — prevents a hung
+        # Pa_CloseStream on the previous clip from contaminating the next
+        # one. The "active" one lives here between _start_recording and
+        # _finalize; it is None the rest of the time.
+        self._active_recorder: Recorder | None = None
         self.recording = False
         # _opening: a background thread is inside sd.InputStream(...).start(),
         # which calls PortAudio's Pa_OpenStream. That call can block forever
@@ -737,12 +741,18 @@ class ScribeApp(rumps.App):
                 return
             self._opening = True
             self._pending_stop = False
+            # Fresh Recorder per recording: an old hung stop() from the
+            # previous clip cannot race with this one.
+            rec = Recorder()
+            self._active_recorder = rec
         self.title = ScribeApp.REC_TITLE
         hk_label = HOTKEYS[self.hotkey_id][2]
         self.status_item.title = f"Listening… release {hk_label} to paste"
-        threading.Thread(target=self._open_stream_worker, daemon=True).start()
+        threading.Thread(
+            target=self._open_stream_worker, args=(rec,), daemon=True,
+        ).start()
 
-    def _open_stream_worker(self) -> None:
+    def _open_stream_worker(self, rec: Recorder) -> None:
         """
         Opens the audio stream off the main thread. Pa_OpenStream can hang
         indefinitely if the audio device is misbehaving; we surface a
@@ -763,7 +773,7 @@ class ScribeApp(rumps.App):
 
         err: Exception | None = None
         try:
-            self.recorder.start()
+            rec.start()
         except Exception as exc:
             err = exc
             print(f"[rec start] {exc}", file=sys.stderr)
@@ -773,6 +783,7 @@ class ScribeApp(rumps.App):
             self._opening = False
             if err is not None:
                 self._pending_stop = False
+                self._active_recorder = None
                 callAfter(lambda: rumps.notification(
                     "Microphone error", "", str(err)[:180] or
                     "Allow microphone access to Scribe in System Settings.",
@@ -783,15 +794,18 @@ class ScribeApp(rumps.App):
                 # User let go of the hotkey before the stream finished
                 # opening — tear it down silently and bail.
                 self._pending_stop = False
-                threading.Thread(target=self._discard_stream, daemon=True).start()
+                self._active_recorder = None
+                threading.Thread(
+                    target=self._discard_stream, args=(rec,), daemon=True,
+                ).start()
                 callAfter(lambda: self._back_to_idle("Too short — ignored"))
                 return
             self.recording = True
 
-    def _discard_stream(self) -> None:
+    def _discard_stream(self, rec: Recorder) -> None:
         """Close a stream we no longer want, without transcribing."""
         try:
-            self.recorder.stop()
+            rec.stop()
         except Exception as exc:
             print(f"[rec discard] {exc}", file=sys.stderr)
 
@@ -805,53 +819,78 @@ class ScribeApp(rumps.App):
             if not self.recording:
                 return
             self.recording = False
+            rec = self._active_recorder
+            self._active_recorder = None
+        if rec is None:
+            # Shouldn't happen, but guard anyway.
+            self._back_to_idle("Idle")
+            return
         # Run transcription on a worker thread — we don't block the UI.
         self.title = ScribeApp.BUSY_TITLE
         self.status_item.title = "Transcribing…"
-        threading.Thread(target=self._finalize, daemon=True).start()
+        threading.Thread(
+            target=self._finalize, args=(rec,), daemon=True,
+        ).start()
 
-    def _finalize(self) -> None:
+    def _finalize(self, rec: Recorder) -> None:
+        """
+        Close the stream, transcribe, save to history, paste.
+
+        CRITICAL: this whole method runs in a try/finally so _back_to_idle
+        ALWAYS fires — the menubar can never get stuck on "Transcribing…".
+        History is saved BEFORE paste so a paste crash can never lose a
+        transcript. rec.stop() has a hard timeout inside scribe_core so
+        a hung Pa_CloseStream never blocks this thread forever.
+        """
+        status = "Ready"
         try:
-            wav, dur_ms = self.recorder.stop()
+            try:
+                wav, dur_ms = rec.stop()
+            except Exception as exc:
+                print(f"[rec stop] {exc}", file=sys.stderr)
+                wav, dur_ms = b"", 0
+
+            # Very short presses (<400ms) are almost certainly accidental.
+            if not wav or dur_ms < 400:
+                status = "Too short — ignored"
+                return
+
+            if not groq_api_key():
+                status = "Set Groq API key in the menu"
+                rumps.notification(
+                    "Groq key missing", "",
+                    "Open the menu → 'Set Groq API key…' to enable dictation.",
+                )
+                return
+
+            lang = None if self._lang == "auto" else self._lang
+            text = transcribe(wav, language=lang or "en").strip()
+
+            if not text or is_garbage(text):
+                status = "No speech detected"
+                return
+
+            # Save to history FIRST. If paste crashes, the transcript is
+            # still safe and accessible from the History menu / ⌃⌘V.
+            try:
+                append_history(text, dur_ms)
+                callAfter(self._refresh_history_menu)
+            except Exception as exc:
+                print(f"[history] {exc}", file=sys.stderr)
+
+            try:
+                paste_text(text)
+            except Exception as exc:
+                print(f"[paste] {exc}", file=sys.stderr)
+
+            status = text if len(text) <= 40 else text[:37] + "…"
         except Exception as exc:
-            print(f"[rec stop] {exc}", file=sys.stderr)
-            wav, dur_ms = b"", 0
-
-        # Very short presses (<400ms) are almost certainly accidental.
-        if not wav or dur_ms < 400:
-            self._back_to_idle("Too short — ignored")
-            return
-
-        if not groq_api_key():
-            self._back_to_idle("Set Groq API key in the menu")
-            rumps.notification(
-                "Groq key missing",
-                "",
-                "Open the menu → 'Set Groq API key…' to enable dictation.",
-            )
-            return
-
-        lang = None if self._lang == "auto" else self._lang
-        text = transcribe(wav, language=lang or "en")
-        text = text.strip()
-
-        if not text or is_garbage(text):
-            self._back_to_idle("No speech detected")
-            return
-
-        try:
-            paste_text(text)
-        except Exception as exc:
-            print(f"[paste] {exc}", file=sys.stderr)
-
-        # History — always kept.
-        try:
-            append_history(text, dur_ms)
-            callAfter(self._refresh_history_menu)
-        except Exception as exc:
-            print(f"[history] {exc}", file=sys.stderr)
-
-        self._back_to_idle(text if len(text) <= 40 else text[:37] + "…")
+            # Any uncaught error (network, JSON, unexpected) lands here and
+            # still reaches the finally below, so the UI always resets.
+            print(f"[finalize] unexpected: {exc}", file=sys.stderr)
+            status = "Error — see log"
+        finally:
+            self._back_to_idle(status)
 
     def _back_to_idle(self, status: str) -> None:
         def _ui() -> None:

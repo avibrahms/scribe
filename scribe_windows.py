@@ -300,12 +300,12 @@ def _confirm_clear_history() -> bool:
 
 class ScribeApp:
     def __init__(self) -> None:
-        self.recorder = Recorder()
+        # Fresh Recorder per recording (see scribe.py for the full rationale).
+        # An old hung Pa_CloseStream on the previous clip cannot contaminate
+        # the next recording, and the stop() inside scribe_core has a hard
+        # 3-second timeout that salvages captured audio on hang.
+        self._active_recorder: Recorder | None = None
         self.recording = False
-        # See scribe.py for the full rationale — the short version is that
-        # Pa_OpenStream can block forever on a bad audio device, so we open
-        # the stream on a worker thread and use these flags to coordinate
-        # with a possible "released before the mic opened" race.
         self._opening = False
         self._pending_stop = False
         self._rec_lock = threading.Lock()
@@ -615,10 +615,14 @@ class ScribeApp:
                 return
             self._opening = True
             self._pending_stop = False
+            rec = Recorder()
+            self._active_recorder = rec
         self._set_state("recording", "Listening…")
-        threading.Thread(target=self._open_stream_worker, daemon=True).start()
+        threading.Thread(
+            target=self._open_stream_worker, args=(rec,), daemon=True,
+        ).start()
 
-    def _open_stream_worker(self) -> None:
+    def _open_stream_worker(self, rec: Recorder) -> None:
         """
         Opens the audio stream off the main thread. Same reasoning as the
         macOS fix: PortAudio's Pa_OpenStream can block indefinitely if the
@@ -637,7 +641,7 @@ class ScribeApp:
 
         err: Exception | None = None
         try:
-            self.recorder.start()
+            rec.start()
         except Exception as exc:
             err = exc
             print(f"[rec start] {exc}", file=sys.stderr)
@@ -647,19 +651,23 @@ class ScribeApp:
             self._opening = False
             if err is not None:
                 self._pending_stop = False
+                self._active_recorder = None
                 self._notify("Microphone error", str(err)[:180])
                 self._set_state("idle", "Mic error")
                 return
             if self._pending_stop:
                 self._pending_stop = False
-                threading.Thread(target=self._discard_stream, daemon=True).start()
+                self._active_recorder = None
+                threading.Thread(
+                    target=self._discard_stream, args=(rec,), daemon=True,
+                ).start()
                 self._set_state("idle", "Too short — ignored")
                 return
             self.recording = True
 
-    def _discard_stream(self) -> None:
+    def _discard_stream(self, rec: Recorder) -> None:
         try:
-            self.recorder.stop()
+            rec.stop()
         except Exception as exc:
             print(f"[rec discard] {exc}", file=sys.stderr)
 
@@ -671,51 +679,70 @@ class ScribeApp:
             if not self.recording:
                 return
             self.recording = False
+            rec = self._active_recorder
+            self._active_recorder = None
+        if rec is None:
+            self._set_state("idle", "Ready")
+            return
         self._set_state("busy", "Transcribing…")
-        threading.Thread(target=self._finalize, daemon=True).start()
+        threading.Thread(
+            target=self._finalize, args=(rec,), daemon=True,
+        ).start()
 
-    def _finalize(self) -> None:
+    def _finalize(self, rec: Recorder) -> None:
+        """
+        Close the stream, transcribe, save to history, paste.
+
+        CRITICAL: wrapped in try/finally so the tray icon ALWAYS returns
+        to idle — never stuck on "Transcribing…". History is written
+        BEFORE paste so a paste failure cannot lose the transcript.
+        rec.stop() has a hard timeout inside scribe_core.
+        """
+        status = "Ready"
         try:
-            wav, dur_ms = self.recorder.stop()
+            try:
+                wav, dur_ms = rec.stop()
+            except Exception as exc:
+                print(f"[rec stop] {exc}", file=sys.stderr)
+                wav, dur_ms = b"", 0
+
+            if not wav or dur_ms < 400:
+                status = "Too short — ignored"
+                return
+
+            if not groq_api_key():
+                status = "Set Groq API key in menu"
+                self._notify(
+                    "Groq key missing",
+                    "Open tray menu → 'Set Groq API key…' to enable dictation.",
+                )
+                return
+
+            lang = None if self._lang == "auto" else self._lang
+            text = transcribe(wav, language=lang or "en").strip()
+
+            if not text or is_garbage(text):
+                status = "No speech detected"
+                return
+
+            # Save to history FIRST so a paste crash cannot lose a transcript.
+            try:
+                append_history(text, dur_ms)
+                self._rebuild_menu()
+            except Exception as exc:
+                print(f"[history] {exc}", file=sys.stderr)
+
+            try:
+                paste_text(text)
+            except Exception as exc:
+                print(f"[paste] {exc}", file=sys.stderr)
+
+            status = text if len(text) <= 40 else text[:37] + "…"
         except Exception as exc:
-            print(f"[rec stop] {exc}", file=sys.stderr)
-            wav, dur_ms = b"", 0
-
-        if not wav or dur_ms < 400:
-            self._set_state("idle", "Too short — ignored")
-            return
-
-        if not groq_api_key():
-            self._set_state("idle", "Set Groq API key in menu")
-            self._notify(
-                "Groq key missing",
-                "Open the tray menu → 'Set Groq API key…' to enable dictation.",
-            )
-            return
-
-        lang = None if self._lang == "auto" else self._lang
-        text = transcribe(wav, language=lang or "en")
-        text = text.strip()
-
-        if not text or is_garbage(text):
-            self._set_state("idle", "No speech detected")
-            return
-
-        try:
-            paste_text(text)
-        except Exception as exc:
-            print(f"[paste] {exc}", file=sys.stderr)
-
-        try:
-            append_history(text, dur_ms)
-            self._rebuild_menu()
-        except Exception as exc:
-            print(f"[history] {exc}", file=sys.stderr)
-
-        self._set_state(
-            "idle",
-            text if len(text) <= 40 else text[:37] + "…",
-        )
+            print(f"[finalize] unexpected: {exc}", file=sys.stderr)
+            status = "Error — see log"
+        finally:
+            self._set_state("idle", status)
 
     # -- entry ------------------------------------------------------------
 

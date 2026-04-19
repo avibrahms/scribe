@@ -279,10 +279,30 @@ def save_voice(voice: str) -> None:
 
 # ---------- audio recorder ------------------------------------------------
 
+import threading  # noqa: E402  (grouped with Recorder which needs it)
+
+
 class Recorder:
-    """Simple in-memory recorder using sounddevice. Mono, 16 kHz, int16."""
+    """
+    In-memory recorder using sounddevice. Mono, 16 kHz, int16.
+
+    The audio callback appends int16 numpy chunks to self._chunks on a
+    PortAudio worker thread. At stop() time we take those chunks and mux
+    them into a WAV in-memory — this is the only thing the transcription
+    stage cares about.
+
+    Critical property: stop() always returns in bounded time (≤ timeout s),
+    even if PortAudio's Pa_StopStream / Pa_CloseStream hangs — which it
+    famously does on macOS when the input device is yanked, switched, or
+    enters a bad state. When PortAudio hangs, we orphan the stream (its
+    daemon close-thread keeps trying in the background) and build the WAV
+    directly from the captured chunks. NO RECORDING IS EVER LOST to a
+    driver bug — that was the previous failure mode where _finalize stuck
+    on Pa_CloseStream and the transcript never made it to history.
+    """
 
     SAMPLE_RATE = 16000
+    STOP_TIMEOUT = 3.0  # seconds; above this we give up on Pa_CloseStream
 
     def __init__(self) -> None:
         self._chunks: list[np.ndarray] = []
@@ -308,16 +328,42 @@ class Recorder:
         )
         self._stream.start()
 
-    def stop(self) -> tuple[bytes, int]:
-        """Returns (wav_bytes, duration_ms). Empty bytes if nothing captured."""
+    def stop(self, timeout: float | None = None) -> tuple[bytes, int]:
+        """
+        Returns (wav_bytes, duration_ms). Empty bytes if nothing captured.
+
+        Runs the PortAudio close on a daemon thread with a hard timeout.
+        If it doesn't return in time, the stream is orphaned and we build
+        the WAV from whatever chunks the callback already delivered. The
+        user's audio is preserved.
+        """
+        if timeout is None:
+            timeout = self.STOP_TIMEOUT
         duration_ms = int((time.time() - self._started_at) * 1000)
-        if self._stream is not None:
-            try:
-                self._stream.stop()
-                self._stream.close()
-            except Exception:
-                pass
-            self._stream = None
+        stream = self._stream
+        self._stream = None
+
+        if stream is not None:
+            done = threading.Event()
+
+            def _close() -> None:
+                try:
+                    stream.stop()
+                    stream.close()
+                except Exception as exc:
+                    print(f"[rec] close error: {exc}", file=sys.stderr)
+                finally:
+                    done.set()
+
+            threading.Thread(target=_close, daemon=True).start()
+            if not done.wait(timeout):
+                # PortAudio hung. Orphan the stream, keep moving.
+                print(
+                    "[rec] Pa_CloseStream timed out after "
+                    f"{timeout}s — orphaning stream, salvaging audio.",
+                    file=sys.stderr,
+                )
+
         if not self._chunks:
             return b"", duration_ms
 
