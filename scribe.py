@@ -104,6 +104,8 @@ from Quartz import (
     kCFRunLoopCommonModes,
     kCGEventFlagsChanged,
     kCGEventKeyDown,
+    kCGEventTapDisabledByTimeout,
+    kCGEventTapDisabledByUserInput,
     kCGHIDEventTap,
     kCGHeadInsertEventTap,
     kCGAnnotatedSessionEventTap,
@@ -294,13 +296,18 @@ class HotkeyWatcher:
     """
 
     def __init__(self, hotkey_id: str, on_change, on_paste_last,
-                 on_tap_silent=None) -> None:
+                 on_tap_silent=None, on_tap_reenabled=None) -> None:
         self._on_change = on_change
         self._on_paste_last = on_paste_last
         # Called on the main thread if the tap goes >N seconds without
         # seeing a single event (strong signal Input Monitoring is not
         # granted — CGEventTapCreate returns a handle but delivers nothing).
         self._on_tap_silent = on_tap_silent
+        # Fired from the tap thread when macOS had disabled our tap and we
+        # just re-armed it. Any push-to-talk recording in flight almost
+        # certainly lost its key-release while the tap was dead, so the app
+        # should recover to a clean idle state.
+        self._on_tap_reenabled = on_tap_reenabled
         self._events_seen = 0
         self._thread: threading.Thread | None = None
         self._tap = None
@@ -325,6 +332,29 @@ class HotkeyWatcher:
     def _callback(self, proxy, event_type, event, refcon):  # noqa: ANN001
         self._events_seen += 1
         try:
+            # macOS can disable the tap without tearing it down — typically
+            # on callback timeout, heavy user input, sleep/wake, or fast
+            # user switch. If we don't re-arm it here, NO further events
+            # arrive and the hotkey stays silently dead until the app is
+            # relaunched. This is the single biggest cause of "icon stuck
+            # red, FN does nothing" in the wild.
+            if event_type == kCGEventTapDisabledByTimeout or \
+               event_type == kCGEventTapDisabledByUserInput:
+                if self._tap is not None:
+                    CGEventTapEnable(self._tap, True)
+                was_pressed = self._pressed
+                # The release event for any in-flight press was almost
+                # certainly dropped while the tap was dead — forget the
+                # press state so the next real press registers cleanly.
+                self._pressed = False
+                if was_pressed and self._on_tap_reenabled is not None:
+                    try:
+                        self._on_tap_reenabled()
+                    except Exception as exc:
+                        print(f"[hotkey] reenable cb: {exc}",
+                              file=sys.stderr)
+                return event
+
             if event_type == kCGEventFlagsChanged:
                 kc = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode)
                 if kc == self._keycode:
@@ -421,6 +451,7 @@ class ScribeApp(rumps.App):
             on_change=self._on_fn_change,
             on_paste_last=self._on_paste_last_shortcut,
             on_tap_silent=self._on_tap_silent,
+            on_tap_reenabled=self._on_tap_reenabled,
         )
         self.hotkey.start()
 
@@ -617,9 +648,18 @@ class ScribeApp(rumps.App):
     def _on_paste_last_shortcut(self) -> None:
         """
         ⌃⌘V global shortcut: paste the last transcript into the focused
-        field while preserving the user's clipboard. Runs on the event-tap
-        thread.
+        field while preserving the user's clipboard.
+
+        Called from the event-tap callback thread. paste_text() sleeps
+        ~280ms in total (clipboard settle + post-paste wait) — long
+        enough to risk tripping macOS's callback-timeout watchdog, which
+        would disable the tap and kill the hotkey until relaunch. So we
+        dispatch the actual work to a background thread and return from
+        the callback immediately.
         """
+        threading.Thread(target=self._do_paste_last, daemon=True).start()
+
+    def _do_paste_last(self) -> None:
         rows = load_history(limit=1)
         if not rows:
             callAfter(lambda: rumps.notification(
@@ -653,6 +693,44 @@ class ScribeApp(rumps.App):
         def cb(_sender: rumps.MenuItem) -> None:
             subprocess.run(["open", url])
         return cb
+
+    def _on_tap_reenabled(self) -> None:
+        """
+        Fired from the tap thread after macOS disabled our event tap
+        (timeout / sleep-wake / fast user switch) and we re-armed it.
+
+        If a push-to-talk recording was in flight, its key-release was
+        dropped while the tap was dead — without recovery, self.recording
+        stays True forever, the icon stays 🔴, and subsequent presses hit
+        the `if self.recording` early-return in _start_recording. Tear
+        the in-flight recording down and return to idle.
+        """
+        callAfter(self._force_cancel_recording)
+
+    def _force_cancel_recording(self) -> None:
+        """
+        Discard any in-flight recording and reset the UI. Used when we
+        know we've lost the key-release event. Must run on the main
+        thread (touches rumps UI state).
+        """
+        rec: Recorder | None = None
+        with self._rec_lock:
+            if self._opening:
+                # Stream hasn't finished opening — let the opener thread
+                # tear it down when it completes, same path as a rapid
+                # press+release.
+                self._pending_stop = True
+                return
+            if not self.recording:
+                return
+            self.recording = False
+            rec = self._active_recorder
+            self._active_recorder = None
+        if rec is not None:
+            threading.Thread(
+                target=self._discard_stream, args=(rec,), daemon=True,
+            ).start()
+        self._back_to_idle("Recovered — hotkey ready")
 
     def _on_tap_silent(self) -> None:
         """
