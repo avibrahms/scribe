@@ -308,6 +308,12 @@ class Recorder:
         self._chunks: list[np.ndarray] = []
         self._stream: sd.InputStream | None = None
         self._started_at: float = 0.0
+        # Set to True when Pa_CloseStream timed out and this recorder's
+        # stream was orphaned. The caller checks this to know PortAudio
+        # is in a bad state and needs a hard reset before the next
+        # open_stream — otherwise the next Pa_OpenStream will hang too
+        # because the device is still held by the zombie.
+        self.orphaned: bool = False
 
     def start(self) -> None:
         self._chunks = []
@@ -358,6 +364,12 @@ class Recorder:
             threading.Thread(target=_close, daemon=True).start()
             if not done.wait(timeout):
                 # PortAudio hung. Orphan the stream, keep moving.
+                # Mark this recorder as orphaned so the caller knows
+                # PortAudio needs a hard reset before the next open,
+                # or the next Pa_OpenStream will also hang — that's
+                # the bug that leaves the app stuck with the icon red
+                # and no FN press doing anything.
+                self.orphaned = True
                 print(
                     "[rec] Pa_CloseStream timed out after "
                     f"{timeout}s — orphaning stream, salvaging audio.",
@@ -420,3 +432,27 @@ _JUNK = {
 def is_garbage(text: str) -> bool:
     norm = "".join(ch for ch in text.lower() if ch.isalpha())
     return len(norm) < 2 or norm in _JUNK
+
+
+# ---------- PortAudio hard reset ------------------------------------------
+
+def reset_portaudio() -> bool:
+    """
+    Hard-reset the PortAudio library. Used after a Pa_CloseStream hang
+    orphans a stream — without this, the next Pa_OpenStream hangs too
+    because the previous (zombie) stream still holds the audio device,
+    leaving the app wedged until relaunch. Returns True on success.
+
+    sd._terminate/_initialize are private but are the documented way to
+    cycle the library; calling them from outside a stream operation is
+    safe. If the zombie thread is still literally inside a PortAudio
+    call this may block too — we run it off the main thread so worst
+    case we leak a thread but never freeze the UI.
+    """
+    try:
+        sd._terminate()
+        sd._initialize()
+        return True
+    except Exception as exc:
+        print(f"[rec] PortAudio reset failed: {exc}", file=sys.stderr)
+        return False

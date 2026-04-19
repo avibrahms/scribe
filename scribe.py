@@ -75,6 +75,7 @@ from scribe_core import (
     save_voice,
     transcribe,
     is_garbage,
+    reset_portaudio,
 )
 
 from AppKit import (
@@ -436,6 +437,12 @@ class ScribeApp(rumps.App):
         # instead of recording.
         self._opening = False
         self._pending_stop = False
+        # True when the previous recording's Pa_CloseStream timed out and
+        # left PortAudio holding the audio device. If we don't reset the
+        # library before the next Pa_OpenStream, that call will hang too
+        # — the exact failure that leaves self._opening stuck True and
+        # the FN key doing nothing until the app is relaunched.
+        self._pa_needs_reset = False
         self._rec_lock = threading.Lock()
         self._lang = "en"  # default transcription language
 
@@ -833,20 +840,51 @@ class ScribeApp(rumps.App):
     def _open_stream_worker(self, rec: Recorder) -> None:
         """
         Opens the audio stream off the main thread. Pa_OpenStream can hang
-        indefinitely if the audio device is misbehaving; we surface a
-        notification if it takes too long so the user knows the app isn't
-        frozen and can fix their audio setup.
+        indefinitely when PortAudio is in a bad state — especially after
+        a previous Pa_CloseStream orphaned its stream. Two defenses:
+
+        1. If the previous recording orphaned its close, hard-reset
+           PortAudio before trying to open. This releases the device
+           that the zombie stream was still holding.
+        2. A real watchdog: if opening doesn't complete in time, we
+           give up, reset app state (self._opening, self._active_recorder)
+           so the NEXT FN press is accepted, and let the zombie open
+           finish eventually in the background. Without this reset, the
+           user has to relaunch the whole app.
         """
+        OPEN_TIMEOUT = 5.0
+
+        # Defense 1: recover from a previous orphaned close.
+        if self._pa_needs_reset:
+            self._pa_needs_reset = False
+            print("[rec] resetting PortAudio before open", file=sys.stderr)
+            reset_portaudio()
+
         opened = threading.Event()
+        aborted = threading.Event()
 
         def _watchdog() -> None:
-            if not opened.wait(5.0):
-                callAfter(lambda: rumps.notification(
-                    "Scribe: mic not responding",
-                    "Audio device is stuck",
-                    "Try toggling your input device (unplug/replug, or switch "
-                    "in System Settings → Sound → Input).",
-                ))
+            if opened.wait(OPEN_TIMEOUT):
+                return
+            # Pa_OpenStream is hung. Give up on this attempt so the app
+            # doesn't stay stuck. The zombie thread may complete later;
+            # we handle that race below.
+            aborted.set()
+            with self._rec_lock:
+                if self._active_recorder is rec:
+                    self._opening = False
+                    self._pending_stop = False
+                    self._active_recorder = None
+                    # PortAudio is clearly wedged — force a reset before
+                    # the user's next attempt.
+                    self._pa_needs_reset = True
+            callAfter(lambda: rumps.notification(
+                "Scribe: mic stuck",
+                "Audio device didn't respond",
+                "Recording aborted. Try again — if it keeps failing, "
+                "switch your input device in System Settings → Sound.",
+            ))
+            callAfter(lambda: self._back_to_idle("Mic stuck — try again"))
         threading.Thread(target=_watchdog, daemon=True).start()
 
         err: Exception | None = None
@@ -858,6 +896,14 @@ class ScribeApp(rumps.App):
         opened.set()
 
         with self._rec_lock:
+            # Race: the watchdog fired already and moved on. We are now
+            # a zombie — discard whatever stream we just opened (may
+            # hang its own close, but that's off the hot path).
+            if aborted.is_set() or self._active_recorder is not rec:
+                threading.Thread(
+                    target=self._discard_stream, args=(rec,), daemon=True,
+                ).start()
+                return
             self._opening = False
             if err is not None:
                 self._pending_stop = False
@@ -886,6 +932,12 @@ class ScribeApp(rumps.App):
             rec.stop()
         except Exception as exc:
             print(f"[rec discard] {exc}", file=sys.stderr)
+        # If the close got orphaned, the audio device is still held by
+        # the zombie stream — flag PortAudio for reset before the next
+        # open so Pa_OpenStream doesn't hang.
+        if getattr(rec, "orphaned", False):
+            with self._rec_lock:
+                self._pa_needs_reset = True
 
     def _stop_recording(self) -> None:
         with self._rec_lock:
@@ -927,6 +979,13 @@ class ScribeApp(rumps.App):
             except Exception as exc:
                 print(f"[rec stop] {exc}", file=sys.stderr)
                 wav, dur_ms = b"", 0
+            # If Pa_CloseStream hung and this stream is now a zombie
+            # holding the audio device, flag PortAudio for reset before
+            # the next open. Without this, the NEXT FN press hangs in
+            # Pa_OpenStream and stays wedged forever.
+            if rec.orphaned:
+                with self._rec_lock:
+                    self._pa_needs_reset = True
 
             # Very short presses (<400ms) are almost certainly accidental.
             if not wav or dur_ms < 400:
