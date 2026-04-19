@@ -25,7 +25,9 @@ from __future__ import annotations
 import io
 import json
 import os
+import subprocess
 import sys
+import tempfile
 import time
 import wave
 from datetime import datetime
@@ -282,110 +284,331 @@ def save_voice(voice: str) -> None:
 import threading  # noqa: E402  (grouped with Recorder which needs it)
 
 
+# The audio capture subprocess — embedded as a string so there's no extra
+# file to package / locate at runtime. This child owns PortAudio; when
+# it hangs (Pa_StopStream / Pa_CloseStream wedging on macOS), we SIGKILL
+# it and the kernel tears down its audio unit, instantly releasing the
+# microphone (the "orange mic icon" stays on until the audio unit is
+# released — killing the process IS the release).
+_AUDIO_CHILD_SCRIPT = r"""
+import os, sys, threading
+import sounddevice as sd
+
+SR = int(sys.argv[1])
+
+_stream = None
+_file = None
+# Strong refs to stopped streams — prevents Python GC from calling
+# __del__ → Pa_CloseStream, which hangs on macOS. We deliberately never
+# close streams; the process exits and the kernel reclaims everything.
+_leaked = []
+_lock = threading.Lock()
+
+def _cb(indata, frames, t, status):
+    f = _file
+    if f is not None:
+        try:
+            f.write(bytes(indata))
+        except Exception:
+            pass
+
+def _do_start(path):
+    global _stream, _file
+    with _lock:
+        if _stream is not None:
+            # Previous recording never got a "stop". Roll it over.
+            _stop_locked()
+        try:
+            _file = open(path, "wb")
+            _stream = sd.InputStream(
+                samplerate=SR, channels=1, dtype="int16",
+                blocksize=0, callback=_cb,
+            )
+            _stream.start()
+            return "ok"
+        except Exception as exc:
+            if _file is not None:
+                try: _file.close()
+                except Exception: pass
+                _file = None
+            _stream = None
+            return "err start " + str(exc)[:160]
+
+def _stop_locked():
+    global _stream, _file
+    if _stream is not None:
+        s = _stream
+        _stream = None
+        try:
+            s.stop()  # Never .close() — Pa_CloseStream hangs on macOS
+        except Exception as exc:
+            sys.stderr.write("[child] stop err: " + str(exc) + "\n")
+            sys.stderr.flush()
+        _leaked.append(s)
+    if _file is not None:
+        try:
+            _file.flush()
+            _file.close()
+        except Exception: pass
+        _file = None
+
+def _do_stop():
+    with _lock:
+        _stop_locked()
+        return "ok"
+
+def _main():
+    sys.stdout.write("ready\n")
+    sys.stdout.flush()
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(None, 1)
+        cmd = parts[0]
+        arg = parts[1] if len(parts) > 1 else ""
+        if cmd == "start":
+            resp = _do_start(arg)
+        elif cmd == "stop":
+            resp = _do_stop()
+        elif cmd == "quit":
+            _do_stop()
+            sys.stdout.write("ok\n")
+            sys.stdout.flush()
+            break
+        else:
+            resp = "err unknown"
+        sys.stdout.write(resp + "\n")
+        sys.stdout.flush()
+
+_main()
+"""
+
+
+def _child_python() -> str:
+    """
+    Path to a Python interpreter that has sounddevice available.
+
+    Inside the Scribe.app bundle, sys.executable resolves to the shared
+    Homebrew Python and does NOT pick up the venv's site-packages when
+    spawned as a subprocess. Point directly at the venv binary — pyvenv.cfg
+    next to it makes site-packages discoverable automatically.
+    """
+    venv_py = APP_DIR / "venv" / "bin" / "python"
+    if venv_py.exists():
+        return str(venv_py)
+    return sys.executable
+
+
+class _RecordService:
+    """
+    Long-lived audio-capture subprocess.
+
+    All PortAudio/CoreAudio state lives in the child. On any hang
+    (Pa_StopStream, Pa_CloseStream, Pa_OpenStream), the parent SIGKILLs
+    the child — this ALWAYS succeeds and causes the kernel to tear down
+    the audio unit, which is the only reliable way to make the orange
+    mic indicator disappear and to release the device for the next
+    recording. The next recording spawns a fresh child, so no zombie
+    state ever leaks between recordings.
+    """
+
+    CMD_TIMEOUT = 2.0     # seconds: how long to wait for a "ok"/"err"
+    KILL_WAIT = 2.0       # seconds: how long to wait for SIGKILL to reap
+
+    def __init__(self) -> None:
+        self._proc: subprocess.Popen | None = None
+        self._lock = threading.Lock()
+
+    # -- lifecycle ----------------------------------------------------
+
+    def _spawn(self) -> None:
+        proc = subprocess.Popen(
+            [_child_python(), "-u", "-c", _AUDIO_CHILD_SCRIPT,
+             str(Recorder.SAMPLE_RATE)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+        line = self._readline(proc, timeout=5.0)
+        if line != "ready":
+            err = b""
+            try:
+                if proc.stderr is not None:
+                    err = proc.stderr.read(2048) or b""
+            except Exception:
+                pass
+            try: proc.kill()
+            except Exception: pass
+            raise RuntimeError(
+                f"audio service did not start (got {line!r}); "
+                f"stderr: {err.decode(errors='replace')[:200]}"
+            )
+        self._proc = proc
+
+    def _readline(self, proc: subprocess.Popen, timeout: float):
+        """Read one line from proc.stdout with a hard timeout. None on timeout."""
+        result: list[str | None] = [None]
+        done = threading.Event()
+        def _r() -> None:
+            try:
+                line = proc.stdout.readline() if proc.stdout else b""
+                result[0] = line.decode(errors="replace").strip() if line else None
+            except Exception:
+                result[0] = None
+            finally:
+                done.set()
+        threading.Thread(target=_r, daemon=True).start()
+        done.wait(timeout)
+        return result[0]
+
+    def _send(self, cmd: str, timeout: float):
+        if self._proc is None or self._proc.poll() is not None:
+            self._spawn()
+        try:
+            assert self._proc is not None and self._proc.stdin is not None
+            self._proc.stdin.write((cmd + "\n").encode())
+            self._proc.stdin.flush()
+        except Exception as exc:
+            print(f"[rec svc] write failed: {exc}", file=sys.stderr)
+            return None
+        return self._readline(self._proc, timeout)
+
+    def _kill(self) -> None:
+        """SIGKILL the child. Cannot fail. Releases the mic at the kernel."""
+        if self._proc is None:
+            return
+        try:
+            self._proc.kill()
+            try:
+                self._proc.wait(timeout=self.KILL_WAIT)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        self._proc = None
+
+    # -- public API ---------------------------------------------------
+
+    def start(self, path: str) -> bool:
+        """Begin capture to `path` (raw 16-bit mono PCM). Returns True on success."""
+        with self._lock:
+            resp = self._send(f"start {path}", timeout=self.CMD_TIMEOUT)
+            if resp == "ok":
+                return True
+            # Service is sick — kill and retry once with a fresh child.
+            print(f"[rec svc] start got {resp!r}; respawning", file=sys.stderr)
+            self._kill()
+            try:
+                resp = self._send(f"start {path}", timeout=self.CMD_TIMEOUT)
+            except Exception as exc:
+                print(f"[rec svc] respawn start failed: {exc}", file=sys.stderr)
+                return False
+            return resp == "ok"
+
+    def stop(self) -> bool:
+        """
+        Stop current capture. Returns True on a clean stop. On False the
+        child was SIGKILLed (because it was hung inside PortAudio) —
+        whatever was written to the file before that is still usable.
+        """
+        with self._lock:
+            if self._proc is None or self._proc.poll() is not None:
+                return True
+            resp = self._send("stop", timeout=self.CMD_TIMEOUT)
+            if resp == "ok":
+                return True
+            # The child is stuck in PortAudio. SIGKILL is the only thing
+            # that will reliably free the mic and clear the orange icon.
+            print(f"[rec svc] stop got {resp!r}; SIGKILL", file=sys.stderr)
+            self._kill()
+            return False
+
+    def shutdown(self) -> None:
+        with self._lock:
+            if self._proc is None:
+                return
+            try:
+                if self._proc.stdin is not None:
+                    self._proc.stdin.write(b"quit\n")
+                    self._proc.stdin.flush()
+                try:
+                    self._proc.wait(timeout=1.0)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            self._kill()
+
+
+# Module-level singleton. Spawned lazily on first recording.
+_svc = _RecordService()
+
+
 class Recorder:
     """
-    In-memory recorder using sounddevice. Mono, 16 kHz, int16.
+    Audio recorder with PortAudio running in a separate subprocess.
 
-    The audio callback appends int16 numpy chunks to self._chunks on a
-    PortAudio worker thread. At stop() time we take those chunks and mux
-    them into a WAV in-memory — this is the only thing the transcription
-    stage cares about.
-
-    Critical property: stop() always returns in bounded time (≤ timeout s),
-    even if PortAudio's Pa_StopStream / Pa_CloseStream hangs — which it
-    famously does on macOS when the input device is yanked, switched, or
-    enters a bad state. When PortAudio hangs, we orphan the stream (its
-    daemon close-thread keeps trying in the background) and build the WAV
-    directly from the captured chunks. NO RECORDING IS EVER LOST to a
-    driver bug — that was the previous failure mode where _finalize stuck
-    on Pa_CloseStream and the transcript never made it to history.
+    Thin facade over _RecordService. Keeps the same .start() / .stop()
+    API that scribe.py expects. The critical invariant: whether or not
+    PortAudio hangs, stop() always returns in bounded time AND the
+    microphone is always released by the end of stop() — via SIGKILL on
+    the child when the graceful path times out. That is what makes the
+    orange mic indicator actually disappear, and what lets the very next
+    FN press start a new recording without a relaunch.
     """
 
     SAMPLE_RATE = 16000
-    STOP_TIMEOUT = 3.0  # seconds; above this we give up on Pa_CloseStream
+    STOP_TIMEOUT = 3.0  # retained for API compatibility; unused in subprocess path
 
     def __init__(self) -> None:
-        self._chunks: list[np.ndarray] = []
-        self._stream: sd.InputStream | None = None
+        self._tmp_path: str | None = None
         self._started_at: float = 0.0
-        # Set to True when Pa_CloseStream timed out and this recorder's
-        # stream was orphaned. The caller checks this to know PortAudio
-        # is in a bad state and needs a hard reset before the next
-        # open_stream — otherwise the next Pa_OpenStream will hang too
-        # because the device is still held by the zombie.
+        # True when the service had to be SIGKILLed because it hung.
+        # Whatever PCM made it to disk is still read and transcribed.
         self.orphaned: bool = False
 
     def start(self) -> None:
-        self._chunks = []
-        self._started_at = time.time()
-
-        def cb(indata, frames, t, status):  # noqa: ANN001
-            if status:
-                # under/overflow — log but keep recording
-                pass
-            self._chunks.append(indata.copy())
-
-        self._stream = sd.InputStream(
-            samplerate=self.SAMPLE_RATE,
-            channels=1,
-            dtype="int16",
-            blocksize=0,
-            callback=cb,
+        tmp = tempfile.NamedTemporaryFile(
+            suffix=".pcm", prefix="scribe-rec-", delete=False,
         )
-        self._stream.start()
+        self._tmp_path = tmp.name
+        tmp.close()
+        self._started_at = time.time()
+        if not _svc.start(self._tmp_path):
+            # Clean up the empty temp file so it doesn't leak.
+            try: os.unlink(self._tmp_path)
+            except Exception: pass
+            self._tmp_path = None
+            raise RuntimeError("audio service failed to start recording")
 
     def stop(self, timeout: float | None = None) -> tuple[bytes, int]:
-        """
-        Returns (wav_bytes, duration_ms). Empty bytes if nothing captured.
-
-        Runs the PortAudio close on a daemon thread with a hard timeout.
-        If it doesn't return in time, the stream is orphaned and we build
-        the WAV from whatever chunks the callback already delivered. The
-        user's audio is preserved.
-        """
-        if timeout is None:
-            timeout = self.STOP_TIMEOUT
         duration_ms = int((time.time() - self._started_at) * 1000)
-        stream = self._stream
-        self._stream = None
+        stopped_cleanly = _svc.stop()
+        self.orphaned = not stopped_cleanly
 
-        if stream is not None:
-            done = threading.Event()
+        data = b""
+        if self._tmp_path is not None:
+            try:
+                if os.path.exists(self._tmp_path):
+                    with open(self._tmp_path, "rb") as f:
+                        data = f.read()
+            except Exception as exc:
+                print(f"[rec] read error: {exc}", file=sys.stderr)
+            try: os.unlink(self._tmp_path)
+            except Exception: pass
+            self._tmp_path = None
 
-            def _close() -> None:
-                try:
-                    stream.stop()
-                    stream.close()
-                except Exception as exc:
-                    print(f"[rec] close error: {exc}", file=sys.stderr)
-                finally:
-                    done.set()
-
-            threading.Thread(target=_close, daemon=True).start()
-            if not done.wait(timeout):
-                # PortAudio hung. Orphan the stream, keep moving.
-                # Mark this recorder as orphaned so the caller knows
-                # PortAudio needs a hard reset before the next open,
-                # or the next Pa_OpenStream will also hang — that's
-                # the bug that leaves the app stuck with the icon red
-                # and no FN press doing anything.
-                self.orphaned = True
-                print(
-                    "[rec] Pa_CloseStream timed out after "
-                    f"{timeout}s — orphaning stream, salvaging audio.",
-                    file=sys.stderr,
-                )
-
-        if not self._chunks:
+        if not data:
             return b"", duration_ms
 
-        data = np.concatenate(self._chunks, axis=0)
         buf = io.BytesIO()
         with wave.open(buf, "wb") as w:
             w.setnchannels(1)
             w.setsampwidth(2)
             w.setframerate(self.SAMPLE_RATE)
-            w.writeframes(data.tobytes())
+            w.writeframes(data)
         return buf.getvalue(), duration_ms
 
 
@@ -438,21 +661,12 @@ def is_garbage(text: str) -> bool:
 
 def reset_portaudio() -> bool:
     """
-    Hard-reset the PortAudio library. Used after a Pa_CloseStream hang
-    orphans a stream — without this, the next Pa_OpenStream hangs too
-    because the previous (zombie) stream still holds the audio device,
-    leaving the app wedged until relaunch. Returns True on success.
+    No-op kept for import compatibility.
 
-    sd._terminate/_initialize are private but are the documented way to
-    cycle the library; calling them from outside a stream operation is
-    safe. If the zombie thread is still literally inside a PortAudio
-    call this may block too — we run it off the main thread so worst
-    case we leak a thread but never freeze the UI.
+    Previously the parent process owned PortAudio and this function
+    cycled the library after a hang. Since Recorder now runs PortAudio
+    in a subprocess, recovery is handled by SIGKILLing that subprocess —
+    which is what _RecordService does on a stop-timeout. There's no
+    parent-side PortAudio state to reset anymore.
     """
-    try:
-        sd._terminate()
-        sd._initialize()
-        return True
-    except Exception as exc:
-        print(f"[rec] PortAudio reset failed: {exc}", file=sys.stderr)
-        return False
+    return True
