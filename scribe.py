@@ -41,6 +41,7 @@ NSBundle.mainBundle().infoDictionary()["LSUIElement"] = "1"
 
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -206,6 +207,96 @@ def _restore_pasteboard(snapshot: list[dict[str, bytes]]) -> None:
         items.append(item)
     if items:
         pb.writeObjects_(items)
+
+
+# Characters that mean "no leading space needed" when they are the last
+# char of the previous Scribe paste. Whitespace (already spaced), openers
+# and opening quotes ("hello (" → no space before "world"), hyphens inside
+# words (well-known), and slash/at/hash for URLs and handles.
+_NO_SPACE_BEFORE = frozenset(
+    " \t\n\r\xa0\u2028\u2029"  # all flavors of whitespace
+    "([{<"                     # openers
+    "\"'`"                     # straight quotes
+    "\u201c\u2018\u00ab"       # opening curly/guillemet quotes
+    "-\u2013\u2014"            # hyphen, en-dash, em-dash
+    "/@#"                      # URL / handle / hashtag
+)
+
+
+# ---------- voice-token expansion -----------------------------------------
+#
+# Spoken phrase → literal character. Only "joiner" style symbols — ones
+# that naturally live between two words with no surrounding spaces
+# (foo/bar, foo-bar, foo_bar, @handle). Punctuation that hugs one side
+# (periods, question marks, parentheses) isn't covered here because
+# Whisper already emits those correctly from prosody.
+#
+# Longer phrases must come before shorter ones that share a suffix so
+# "forward slash" is consumed before "slash" gets a chance to match.
+#
+# Known trade-off: if the user genuinely means the WORD "slash"/"dash" in
+# a sentence, it'll still get converted. For hands-free coding/URL/email
+# dictation the ergonomic win is worth the rare false positive; the user
+# can always edit.
+_VOICE_JOINERS: list[tuple[str, str]] = [
+    # Two-word phrases first (longest-match ordering).
+    ("forward slash", "/"),
+    ("back slash",    "\\"),
+    ("under score",   "_"),
+    ("at sign",       "@"),
+    ("hash sign",     "#"),
+    ("pound sign",    "#"),
+    ("plus sign",     "+"),
+    ("equals sign",   "="),
+    ("equal sign",    "="),
+    ("percent sign",  "%"),
+    ("dollar sign",   "$"),
+    ("vertical bar",  "|"),
+    # Single-word tokens.
+    ("hashtag",       "#"),
+    ("asterisk",      "*"),
+    ("backslash",     "\\"),
+    ("underscore",    "_"),
+    ("ampersand",     "&"),
+    ("slash",         "/"),
+    ("hyphen",        "-"),
+    ("dash",          "-"),
+    ("tilde",         "~"),
+    ("caret",         "^"),
+    ("pipe",          "|"),
+]
+
+# Precompiled patterns: `\s*\b…\b\s*` so surrounding whitespace is
+# consumed ("foo slash bar" → "foo/bar"), word boundaries so substrings
+# inside real words are left alone ("slashed", "dashboard").
+_VOICE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"\s*\b" + re.escape(phrase) + r"\b\s*", re.IGNORECASE), char)
+    for phrase, char in _VOICE_JOINERS
+]
+
+
+def _apply_voice_tokens(text: str) -> str:
+    """
+    Replace spoken joiner tokens with their literal characters, eating
+    surrounding whitespace so the output reads as natural inline
+    punctuation.
+
+        "hello slash world"     → "hello/world"
+        "foo dash bar"          → "foo-bar"
+        "my path underscore x"  → "my path_x"
+        "ship it hashtag launch"→ "ship it#launch"
+
+    Applied in insertion order — longer phrases first — so "forward
+    slash" wins over "slash", etc.
+    """
+    original = text
+    for pattern, char in _VOICE_PATTERNS:
+        # Replacement goes through a lambda so backreferences like `\1`
+        # and a literal `\` in `char` aren't interpreted by re.sub.
+        text = pattern.sub(lambda _m, c=char: c, text)
+    if text != original:
+        print(f"[voice-tokens] {original!r} → {text!r}", file=sys.stderr)
+    return text
 
 
 def paste_text(text: str) -> None:
@@ -445,6 +536,18 @@ class ScribeApp(rumps.App):
         self._pa_needs_reset = False
         self._rec_lock = threading.Lock()
         self._lang = "en"  # default transcription language
+
+        # Back-to-back dictation space guard. We can't read the focused
+        # field's caret without diving into the Accessibility API (and
+        # AX reads are unreliable in Electron, Chrome, sandboxed apps).
+        # So we track what Scribe itself last pasted: if the next paste
+        # happens soon, into the same frontmost app, and the previous
+        # paste ended on a non-space/non-opener char, we prepend a space.
+        # Misses the "user typed/clicked between dictations" case, but
+        # never inserts a wrong space when the user is clearly elsewhere.
+        self._last_paste_tail: str | None = None
+        self._last_paste_bundle: str | None = None
+        self._last_paste_ts: float = 0.0
 
         self.current_voice = load_voice()
         self.hotkey_id = load_hotkey_id()
@@ -741,10 +844,41 @@ class ScribeApp(rumps.App):
 
     def _on_tap_silent(self) -> None:
         """
-        Called from the tap thread after 20s of silence — almost certainly
-        missing Input Monitoring permission. Surface a clear notification
-        and open the correct Settings pane on the main thread.
+        Called from the tap thread after 20s of silence.
+
+        Two things can cause 20s of silence:
+          (a) Input Monitoring is genuinely not granted — the tap returns
+              a handle but delivers zero events.
+          (b) The user simply hasn't touched the keyboard since Scribe
+              started. This is the norm at login: the LaunchAgent
+              auto-starts Scribe and the user's hands are off the keys
+              for the first minute while the desktop settles. This used
+              to pop open System Settings on every boot — false positive.
+
+        Before hijacking focus, confirm permission is actually denied
+        via IOHIDCheckAccess. If granted, stay silent: the tap will
+        wake up the instant the user types.
         """
+        # Guard against the cold-boot false positive.
+        # kIOHIDRequestTypeListenEvent = 1, kIOHIDAccessTypeGranted = 0.
+        try:
+            from Quartz import (
+                IOHIDCheckAccess,
+                kIOHIDRequestTypeListenEvent,
+            )
+            if IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == 0:
+                return
+        except Exception:
+            # If the API isn't importable on this macOS/pyobjc version,
+            # fall back to just flagging it in the menubar — still
+            # don't auto-open Settings, since the false positive is
+            # worse than a missed warning (the user can see the ⚠
+            # title and click the permissions menu manually).
+            def _flag_only() -> None:
+                self.status_item.title = "⚠ Grant Input Monitoring to Scribe"
+            callAfter(_flag_only)
+            return
+
         def _ui() -> None:
             hk_label = HOTKEYS[self.hotkey_id][2]
             self.status_item.title = "⚠ Grant Input Monitoring to Scribe"
@@ -1002,6 +1136,9 @@ class ScribeApp(rumps.App):
 
             lang = None if self._lang == "auto" else self._lang
             text = transcribe(wav, language=lang or "en").strip()
+            # Turn spoken "slash/dash/underscore/etc." into literal chars
+            # before history, space-guard, and paste all see the same text.
+            text = _apply_voice_tokens(text)
 
             if not text or is_garbage(text):
                 status = "No speech detected"
@@ -1015,8 +1152,21 @@ class ScribeApp(rumps.App):
             except Exception as exc:
                 print(f"[history] {exc}", file=sys.stderr)
 
+            # Prepend a space when the previous dictation landed in the
+            # same app recently and didn't end on whitespace/opener. Only
+            # the pasted string gets the prefix — history keeps the clean
+            # transcript. Read the bundle BEFORE pasting so focus-stealing
+            # side-effects of ⌘V can't confuse the check.
+            bundle = self._frontmost_bundle()
             try:
-                paste_text(text)
+                to_paste = self._maybe_prepend_space(text, bundle)
+            except Exception as exc:
+                print(f"[space-guard] {exc}", file=sys.stderr)
+                to_paste = text
+
+            try:
+                paste_text(to_paste)
+                self._record_paste(to_paste, bundle)
             except Exception as exc:
                 print(f"[paste] {exc}", file=sys.stderr)
 
@@ -1028,6 +1178,67 @@ class ScribeApp(rumps.App):
             status = "Error — see log"
         finally:
             self._back_to_idle(status)
+
+    # -- back-to-back space guard ----------------------------------------
+
+    _SPACE_GUARD_WINDOW = 60.0  # seconds
+
+    def _frontmost_bundle(self) -> str | None:
+        """Bundle identifier of the app currently in the foreground, or
+        None if we can't determine it. Read-only NSWorkspace query — safe
+        to call from any thread."""
+        try:
+            from AppKit import NSWorkspace
+            app = NSWorkspace.sharedWorkspace().frontmostApplication()
+            if app is None:
+                return None
+            bid = app.bundleIdentifier()
+            return str(bid) if bid is not None else None
+        except Exception:
+            return None
+
+    def _maybe_prepend_space(self, text: str, bundle: str | None) -> str:
+        """
+        Decide whether to prepend a space to `text` so back-to-back
+        dictations don't smash together. Returns the text to actually
+        paste. `bundle` is the frontmost app bundle read at call time
+        (passed in rather than re-read so the decision and the tracker
+        update agree on "which app").
+        """
+        if not text or text[0].isspace():
+            print("[space-guard] skip: transcript already starts with "
+                  "whitespace", file=sys.stderr)
+            return text
+        if self._last_paste_tail is None:
+            print("[space-guard] skip: no previous paste recorded",
+                  file=sys.stderr)
+            return text
+        if self._last_paste_tail in _NO_SPACE_BEFORE:
+            print(f"[space-guard] skip: prev tail {self._last_paste_tail!r} "
+                  f"is in no-space set", file=sys.stderr)
+            return text
+        age = time.monotonic() - self._last_paste_ts
+        if age > self._SPACE_GUARD_WINDOW:
+            print(f"[space-guard] skip: prev paste was {age:.1f}s ago "
+                  f"(> {self._SPACE_GUARD_WINDOW}s)", file=sys.stderr)
+            return text
+        if bundle is None or bundle != self._last_paste_bundle:
+            print(f"[space-guard] skip: bundle mismatch "
+                  f"(now={bundle!r}, prev={self._last_paste_bundle!r})",
+                  file=sys.stderr)
+            return text
+        print(f"[space-guard] PREPEND: prev tail {self._last_paste_tail!r}, "
+              f"bundle {bundle!r}, age {age:.1f}s", file=sys.stderr)
+        return " " + text
+
+    def _record_paste(self, pasted: str, bundle: str | None) -> None:
+        """Remember what we just pasted so the next dictation can decide
+        whether to lead with a space."""
+        self._last_paste_tail = pasted[-1] if pasted else None
+        self._last_paste_bundle = bundle
+        self._last_paste_ts = time.monotonic()
+        print(f"[space-guard] recorded: tail={self._last_paste_tail!r}, "
+              f"bundle={bundle!r}", file=sys.stderr)
 
     def _back_to_idle(self, status: str) -> None:
         def _ui() -> None:
