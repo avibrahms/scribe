@@ -194,6 +194,26 @@ def save_cfg(cfg: dict) -> None:
     CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
 
 
+SUPPORTED_STT_LANGS = {"en", "fr", "es", "de", "it", "auto"}
+
+
+def load_stt_language(default: str = "en") -> str:
+    cfg = load_cfg()
+    lang = str(cfg.get("stt_language", "")).strip().lower()
+    if lang in SUPPORTED_STT_LANGS:
+        return lang
+    return default
+
+
+def save_stt_language(language: str) -> None:
+    language = language.strip().lower()
+    if language not in SUPPORTED_STT_LANGS:
+        return
+    cfg = load_cfg()
+    cfg["stt_language"] = language
+    save_cfg(cfg)
+
+
 def groq_api_key() -> str:
     k = (os.environ.get("GROQ_API_KEY") or "").strip()
     if k:
@@ -618,24 +638,27 @@ GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 STT_MODEL = "whisper-large-v3-turbo"
 
 
-def transcribe(wav_bytes: bytes, language: str = "en") -> str:
+def transcribe(wav_bytes: bytes, language: str | None = "en") -> str:
     key = groq_api_key()
     if not key:
         return ""
     if not wav_bytes:
         return ""
     try:
+        data = {
+            "model": STT_MODEL,
+            "response_format": "json",
+            "temperature": "0",
+        }
+        # Omitting `language` lets Whisper auto-detect the spoken language.
+        if language:
+            data["language"] = language
         with httpx.Client(timeout=30.0) as c:
             r = c.post(
                 GROQ_URL,
                 headers={"Authorization": f"Bearer {key}"},
                 files={"file": ("rec.wav", wav_bytes, "audio/wav")},
-                data={
-                    "model": STT_MODEL,
-                    "language": language,
-                    "response_format": "json",
-                    "temperature": "0",
-                },
+                data=data,
             )
             r.raise_for_status()
             return (r.json().get("text") or "").strip()

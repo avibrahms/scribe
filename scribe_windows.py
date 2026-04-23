@@ -59,7 +59,9 @@ from scribe_core import (
     save_cfg,
     groq_api_key,
     save_groq_key_to_dotenv,
+    load_stt_language,
     load_voice,
+    save_stt_language,
     save_voice,
     transcribe,
     is_garbage,
@@ -309,7 +311,7 @@ class ScribeApp:
         self._opening = False
         self._pending_stop = False
         self._rec_lock = threading.Lock()
-        self._lang = "en"
+        self._lang = load_stt_language("en")
 
         self.current_voice = load_voice()
         self.hotkey_id = load_hotkey_id()
@@ -483,6 +485,7 @@ class ScribeApp:
     def _make_lang_cb(self, code: str):
         def cb(_icon, _item):
             self._lang = code
+            save_stt_language(code)
             self._rebuild_menu()
         return cb
 
@@ -719,7 +722,7 @@ class ScribeApp:
                 return
 
             lang = None if self._lang == "auto" else self._lang
-            text = transcribe(wav, language=lang or "en").strip()
+            text = transcribe(wav, language=lang).strip()
 
             if not text or is_garbage(text):
                 status = "No speech detected"

@@ -72,7 +72,9 @@ from scribe_core import (
     save_cfg,
     groq_api_key,
     save_groq_key_to_dotenv,
+    load_stt_language,
     load_voice,
+    save_stt_language,
     save_voice,
     transcribe,
     is_garbage,
@@ -535,7 +537,7 @@ class ScribeApp(rumps.App):
         # the FN key doing nothing until the app is relaunched.
         self._pa_needs_reset = False
         self._rec_lock = threading.Lock()
-        self._lang = "en"  # default transcription language
+        self._lang = load_stt_language("en")
 
         # Back-to-back dictation space guard. We can't read the focused
         # field's caret without diving into the Accessibility API (and
@@ -711,6 +713,7 @@ class ScribeApp(rumps.App):
                 item.state = 0
             sender.state = 1
             self._lang = code
+            save_stt_language(code)
         return cb
 
     def _make_copy_cb(self, text: str):
@@ -1135,7 +1138,7 @@ class ScribeApp(rumps.App):
                 return
 
             lang = None if self._lang == "auto" else self._lang
-            text = transcribe(wav, language=lang or "en").strip()
+            text = transcribe(wav, language=lang).strip()
             # Turn spoken "slash/dash/underscore/etc." into literal chars
             # before history, space-guard, and paste all see the same text.
             text = _apply_voice_tokens(text)
