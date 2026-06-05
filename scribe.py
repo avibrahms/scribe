@@ -122,6 +122,8 @@ from Quartz import (
 # call into scribe_core.groq_api_key().
 _load_dotenv(DOTENV_FILE)
 
+EDGE_TTS_STREAM = Path.home() / "bin" / "edge-tts-stream"
+
 
 # ---------- helpers: foreground activation --------------------------------
 
@@ -156,15 +158,23 @@ def copy_to_pasteboard(text: str) -> None:
 
 def post_cmd_v() -> None:
     """Send ⌘V so whatever has focus receives a paste."""
-    # Virtual key code for 'v' on an ANSI US layout is 9.
-    V = 9
+    post_cmd_key(9)
+
+
+def post_cmd_c() -> None:
+    """Send ⌘C so the frontmost app copies the current selection."""
+    post_cmd_key(8)
+
+
+def post_cmd_key(keycode: int) -> None:
+    """Send ⌘ + keycode to the frontmost app."""
     CMD = 1 << 20  # kCGEventFlagMaskCommand
 
-    down = CGEventCreateKeyboardEvent(None, V, True)
+    down = CGEventCreateKeyboardEvent(None, keycode, True)
     CGEventSetFlags(down, CMD)
     CGEventPost(kCGHIDEventTap, down)
 
-    up = CGEventCreateKeyboardEvent(None, V, False)
+    up = CGEventCreateKeyboardEvent(None, keycode, False)
     CGEventSetFlags(up, CMD)
     CGEventPost(kCGHIDEventTap, up)
 
@@ -209,6 +219,12 @@ def _restore_pasteboard(snapshot: list[dict[str, bytes]]) -> None:
         items.append(item)
     if items:
         pb.writeObjects_(items)
+
+
+def _pasteboard_text() -> str:
+    pb = NSPasteboard.generalPasteboard()
+    value = pb.stringForType_(NSPasteboardTypeString)
+    return str(value) if value is not None else ""
 
 
 # Characters that mean "no leading space needed" when they are the last
@@ -375,9 +391,11 @@ def save_hotkey_id(hotkey_id: str) -> None:
 
 
 # Paste-last-transcript shortcut: ⌃⌘V (Control + Command + V).
-# V has virtual keycode 9 on Mac ANSI layouts.
+# Letter keycodes below are Mac ANSI layout virtual keycodes.
 _KEYCODE_V = 9
+_KEYCODE_S = 1
 _PASTE_LAST_MODS = _FLAG_CONTROL | _FLAG_COMMAND
+_TTS_STOP_MODS = _FLAG_CONTROL
 # Mask of modifiers we compare against, ignoring CapsLock and NumericPad bits.
 _MOD_COMPARE_MASK = _FLAG_SHIFT | _FLAG_CONTROL | _FLAG_OPTION | _FLAG_COMMAND
 
@@ -390,9 +408,11 @@ class HotkeyWatcher:
     """
 
     def __init__(self, hotkey_id: str, on_change, on_paste_last,
+                 on_tts_stop=None,
                  on_tap_silent=None, on_tap_reenabled=None) -> None:
         self._on_change = on_change
         self._on_paste_last = on_paste_last
+        self._on_tts_stop = on_tts_stop
         # Called on the main thread if the tap goes >N seconds without
         # seeing a single event (strong signal Input Monitoring is not
         # granted — CGEventTapCreate returns a handle but delivers nothing).
@@ -459,10 +479,13 @@ class HotkeyWatcher:
                         self._on_change(pressed_now)
             elif event_type == kCGEventKeyDown:
                 kc = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode)
+                mods = CGEventGetFlags(event) & _MOD_COMPARE_MASK
                 if kc == _KEYCODE_V:
-                    mods = CGEventGetFlags(event) & _MOD_COMPARE_MASK
                     if mods == _PASTE_LAST_MODS:
                         self._on_paste_last()
+                elif kc == _KEYCODE_S:
+                    if mods == _TTS_STOP_MODS and self._on_tts_stop is not None:
+                        self._on_tts_stop()
         except Exception as exc:
             print(f"[hotkey] cb error: {exc}", file=sys.stderr)
         return event
@@ -562,6 +585,7 @@ class ScribeApp(rumps.App):
             self.hotkey_id,
             on_change=self._on_fn_change,
             on_paste_last=self._on_paste_last_shortcut,
+            on_tts_stop=self._on_stop_reading_shortcut,
             on_tap_silent=self._on_tap_silent,
             on_tap_reenabled=self._on_tap_reenabled,
         )
@@ -596,6 +620,20 @@ class ScribeApp(rumps.App):
                     item.state = 1
                 sub.add(item)
             self.voice_menu.add(sub)
+
+        # Text-to-speech actions
+        self.read_selected_item = rumps.MenuItem(
+            "Read selected text  ⌃D",
+            callback=self.on_read_selected_text,
+        )
+        self.read_copied_item = rumps.MenuItem(
+            "Read copied text  ⌃X",
+            callback=self.on_read_copied_text,
+        )
+        self.stop_reading_item = rumps.MenuItem(
+            "Stop reading  ⌃S",
+            callback=self.on_stop_reading,
+        )
 
         # Test speak
         self.test_item = rumps.MenuItem("Test Voice", callback=self.on_test_voice)
@@ -643,6 +681,9 @@ class ScribeApp(rumps.App):
             self.status_item,
             None,
             self.voice_menu,
+            self.read_selected_item,
+            self.read_copied_item,
+            self.stop_reading_item,
             self.test_item,
             None,
             self.hotkey_menu,
@@ -915,6 +956,99 @@ class ScribeApp(rumps.App):
             save_groq_key_to_dotenv(new_key)
             os.environ["GROQ_API_KEY"] = new_key
             rumps.notification("Groq key saved", "", f"Written to {DOTENV_FILE}")
+
+    def on_read_selected_text(self, _sender) -> None:
+        threading.Thread(target=self._read_selected_text, daemon=True).start()
+
+    def on_read_copied_text(self, _sender) -> None:
+        threading.Thread(target=self._read_copied_text, daemon=True).start()
+
+    def on_stop_reading(self, _sender) -> None:
+        self._stop_reading()
+
+    def _on_stop_reading_shortcut(self) -> None:
+        threading.Thread(target=self._stop_reading, daemon=True).start()
+
+    def _read_selected_text(self) -> None:
+        snapshot = _snapshot_pasteboard()
+        pb = NSPasteboard.generalPasteboard()
+        before_change = int(pb.changeCount())
+        before_text = _pasteboard_text()
+        text = ""
+        try:
+            post_cmd_c()
+            time.sleep(0.15)
+            after_change = int(pb.changeCount())
+            copied = _pasteboard_text().strip()
+            if copied and (after_change != before_change or copied != before_text.strip()):
+                text = copied
+        finally:
+            try:
+                _restore_pasteboard(snapshot)
+            except Exception as exc:
+                print(f"[pasteboard] restore failed after read selection: {exc}",
+                      file=sys.stderr)
+        if not text:
+            callAfter(lambda: rumps.notification(
+                "No selected text", "", "Select text first, then choose Read selected text."
+            ))
+            return
+        self._speak_text(text)
+
+    def _read_copied_text(self) -> None:
+        text = _pasteboard_text().strip()
+        if not text:
+            callAfter(lambda: rumps.notification(
+                "Clipboard empty", "", "Copy text first, then choose Read copied text."
+            ))
+            return
+        self._speak_text(text)
+
+    def _speak_text(self, text: str) -> None:
+        if not EDGE_TTS_STREAM.exists():
+            callAfter(lambda: rumps.notification(
+                "Read aloud unavailable", "", f"Missing {EDGE_TTS_STREAM}"
+            ))
+            return
+        try:
+            proc = subprocess.Popen(
+                [str(EDGE_TTS_STREAM), "--stdin"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+            if proc.stdin is not None:
+                proc.stdin.write(text)
+                proc.stdin.close()
+        except Exception as exc:
+            msg = str(exc)[:160]
+            print(f"[tts] start failed: {exc}", file=sys.stderr)
+            callAfter(lambda: rumps.notification(
+                "Read aloud failed", "", msg
+            ))
+
+    def _stop_reading(self) -> None:
+        if not EDGE_TTS_STREAM.exists():
+            callAfter(lambda: rumps.notification(
+                "Stop unavailable", "", f"Missing {EDGE_TTS_STREAM}"
+            ))
+            return
+        try:
+            subprocess.run(
+                [str(EDGE_TTS_STREAM), "--stop"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+                check=False,
+            )
+            callAfter(lambda: rumps.notification("Reading stopped", "", ""))
+        except Exception as exc:
+            msg = str(exc)[:160]
+            print(f"[tts] stop failed: {exc}", file=sys.stderr)
+            callAfter(lambda: rumps.notification(
+                "Stop failed", "", msg
+            ))
 
     def on_test_voice(self, _sender) -> None:
         threading.Thread(target=self._speak_test, daemon=True).start()
