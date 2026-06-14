@@ -310,8 +310,15 @@ DEFAULT_TTS_ENGINE = "openai"
 OPENAI_TTS_MODEL = "gpt-4o-mini-tts"
 DEFAULT_OPENAI_VOICE = "coral"
 DEFAULT_TTS_INSTRUCTIONS = (
-    "Speak in a warm, natural, and expressive tone, like a friendly human "
-    "reading aloud — relaxed pacing, gentle emotion, never robotic."
+    "Perform this text aloud like an expressive human storyteller — never a "
+    "narrator droning through a script. Constantly vary your pitch, pace, and "
+    "volume: rise with excitement, slow down and lower your voice for emphasis "
+    "or suspense, lift the ends of questions, and let energy build and release "
+    "across sentences. Use clear emotional ups and downs that match the meaning "
+    "of the words — warmth, curiosity, surprise, enthusiasm. Add natural human "
+    "rhythm with small pauses for breath and thought. Absolutely avoid a flat, "
+    "monotone, robotic, or detached delivery; every sentence should sound alive "
+    "and genuinely felt."
 )
 
 # Curated gpt-4o-mini-tts voices (label, id). All support emotion steering.
