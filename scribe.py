@@ -42,6 +42,7 @@ NSBundle.mainBundle().infoDictionary()["LSUIElement"] = "1"
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -63,6 +64,8 @@ from scribe_core import (
     SETTINGS_FILE,
     VOICES,
     DEFAULT_VOICE,
+    OPENAI_VOICES,
+    OPENAI_TTS_MODEL,
     Recorder,
     load_dotenv as _load_dotenv,
     append_history,
@@ -76,6 +79,13 @@ from scribe_core import (
     load_voice,
     save_stt_language,
     save_voice,
+    load_tts_engine,
+    save_tts_engine,
+    load_openai_voice,
+    save_openai_voice,
+    load_tts_instructions,
+    openai_api_key,
+    save_openai_key,
     transcribe,
     is_garbage,
     reset_portaudio,
@@ -123,6 +133,7 @@ from Quartz import (
 _load_dotenv(DOTENV_FILE)
 
 EDGE_TTS_STREAM = Path.home() / "bin" / "edge-tts-stream"
+OPENAI_TTS_STREAM = Path.home() / "bin" / "openai-tts-stream"
 
 
 # ---------- helpers: foreground activation --------------------------------
@@ -574,7 +585,17 @@ class ScribeApp(rumps.App):
         self._last_paste_bundle: str | None = None
         self._last_paste_ts: float = 0.0
 
+        # The TTS playback child we spawned (edge-tts-stream or afplay).
+        # Stop must never depend solely on edge-tts-stream's PID file: a
+        # child that wedges before writing it (seen in the wild, stuck in
+        # sys.stdin.read()) is invisible to `--stop` forever. Holding the
+        # Popen lets the Stop button kill the process group directly.
+        self._tts_proc: subprocess.Popen | None = None
+        self._tts_lock = threading.Lock()
+
         self.current_voice = load_voice()
+        self.tts_engine = load_tts_engine()
+        self.openai_voice = load_openai_voice()
         self.hotkey_id = load_hotkey_id()
 
         self._build_menu()
@@ -607,8 +628,27 @@ class ScribeApp(rumps.App):
                 mi.state = 1
             self.hotkey_menu.add(mi)
 
-        # TTS voice picker
-        self.voice_menu = rumps.MenuItem("TTS Voice")
+        # TTS engine picker (OpenAI vs Microsoft Edge). Persisted choice.
+        self.engine_menu = rumps.MenuItem("TTS Engine")
+        for eng_id, eng_label in (
+            ("openai", "OpenAI · natural, emotional"),
+            ("edge", "Microsoft Edge · free"),
+        ):
+            mi = rumps.MenuItem(eng_label, callback=self._make_engine_cb(eng_id))
+            if eng_id == self.tts_engine:
+                mi.state = 1
+            self.engine_menu.add(mi)
+
+        # OpenAI voice picker (used when the OpenAI engine is selected).
+        self.openai_voice_menu = rumps.MenuItem("OpenAI Voice")
+        for label, voice_id in OPENAI_VOICES:
+            item = rumps.MenuItem(label, callback=self._make_openai_voice_cb(voice_id))
+            if voice_id == self.openai_voice:
+                item.state = 1
+            self.openai_voice_menu.add(item)
+
+        # Edge voice picker (used when the Edge engine is selected).
+        self.voice_menu = rumps.MenuItem("Edge Voice")
         for lang, voices in VOICES.items():
             sub = rumps.MenuItem(lang)
             for label, voice_id in voices:
@@ -676,10 +716,15 @@ class ScribeApp(rumps.App):
 
         # Key status
         self.set_key_item = rumps.MenuItem("Set Groq API key…", callback=self.on_set_key)
+        self.set_openai_key_item = rumps.MenuItem(
+            "Set OpenAI API key…", callback=self.on_set_openai_key
+        )
 
         self.menu = [
             self.status_item,
             None,
+            self.engine_menu,
+            self.openai_voice_menu,
             self.voice_menu,
             self.read_selected_item,
             self.read_copied_item,
@@ -692,6 +737,7 @@ class ScribeApp(rumps.App):
             None,
             self.perms_item,
             self.set_key_item,
+            self.set_openai_key_item,
             None,
             rumps.MenuItem("Quit Scribe", callback=self._quit),
         ]
@@ -745,7 +791,29 @@ class ScribeApp(rumps.App):
             sender.state = 1
             self.current_voice = voice_id
             save_voice(voice_id)
-            rumps.notification("Voice set", voice_id, "")
+            rumps.notification("Edge voice set", voice_id, "")
+        return cb
+
+    def _make_engine_cb(self, engine_id: str):
+        def cb(sender: rumps.MenuItem) -> None:
+            for item in self.engine_menu.values():
+                item.state = 0
+            sender.state = 1
+            self.tts_engine = engine_id
+            save_tts_engine(engine_id)
+            label = "OpenAI (natural, emotional)" if engine_id == "openai" \
+                else "Microsoft Edge (free)"
+            rumps.notification("TTS engine", label, "")
+        return cb
+
+    def _make_openai_voice_cb(self, voice_id: str):
+        def cb(sender: rumps.MenuItem) -> None:
+            for item in self.openai_voice_menu.values():
+                item.state = 0
+            sender.state = 1
+            self.openai_voice = voice_id
+            save_openai_voice(voice_id)
+            rumps.notification("OpenAI voice set", voice_id, "")
         return cb
 
     def _make_lang_cb(self, code: str):
@@ -957,6 +1025,27 @@ class ScribeApp(rumps.App):
             os.environ["GROQ_API_KEY"] = new_key
             rumps.notification("Groq key saved", "", f"Written to {DOTENV_FILE}")
 
+    def on_set_openai_key(self, _sender) -> None:
+        # Masked-ish entry: show only a hint of any existing key, never the
+        # whole secret, in the prefilled field.
+        existing = openai_api_key()
+        hint = (existing[:7] + "…" + existing[-4:]) if len(existing) > 12 else existing
+        with _foreground_app():
+            win = rumps.Window(
+                title="OpenAI API key",
+                message="Paste your OpenAI API key (used for natural TTS). "
+                        f"Current: {hint or 'none'}",
+                default_text="",
+                ok="Save", cancel="Cancel",
+                dimensions=(360, 24),
+            )
+            resp = win.run()
+        if resp.clicked:
+            new_key = resp.text.strip()
+            if new_key:
+                save_openai_key(new_key)
+                rumps.notification("OpenAI key saved", "", "Stored securely (not in git).")
+
     def on_read_selected_text(self, _sender) -> None:
         threading.Thread(target=self._read_selected_text, daemon=True).start()
 
@@ -1005,55 +1094,155 @@ class ScribeApp(rumps.App):
         self._speak_text(text)
 
     def _speak_text(self, text: str) -> None:
-        if not EDGE_TTS_STREAM.exists():
+        # Pick the backend by the persisted engine choice. OpenAI is the
+        # default; Edge is the free fallback. If OpenAI is selected but the
+        # key is missing, fall back to Edge so Read aloud still works.
+        use_openai = self.tts_engine == "openai"
+        if use_openai and not openai_api_key():
             callAfter(lambda: rumps.notification(
-                "Read aloud unavailable", "", f"Missing {EDGE_TTS_STREAM}"
+                "OpenAI key missing", "Falling back to Edge voice",
+                "Set it via 'Set OpenAI API key…'.",
+            ))
+            use_openai = False
+
+        helper = OPENAI_TTS_STREAM if use_openai else EDGE_TTS_STREAM
+        if not helper.exists():
+            callAfter(lambda: rumps.notification(
+                "Read aloud unavailable", "", f"Missing {helper}"
             ))
             return
+
+        # Child inherits our env; for OpenAI pass the key + chosen voice so the
+        # helper needs no extra lookup. Voice/instructions also live in
+        # settings.json as a fallback for standalone use.
+        env = os.environ.copy()
+        cmd = [str(helper), "--stdin"]
+        if use_openai:
+            key = openai_api_key()
+            if key:
+                env["OPENAI_API_KEY"] = key
+            cmd += ["--voice", self.openai_voice]
+
+        # Replace any playback we already own before starting a new one.
+        self._kill_tts_proc()
+        proc = None
         try:
+            # start_new_session: the child is its own session/group leader
+            # from birth, so Stop can killpg(child.pid) at any moment —
+            # including the window before the helper registers itself —
+            # without ever touching Scribe's own process group.
             proc = subprocess.Popen(
-                [str(EDGE_TTS_STREAM), "--stdin"],
+                cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                text=True,
+                start_new_session=True,
+                env=env,
             )
-            if proc.stdin is not None:
-                proc.stdin.write(text)
-                proc.stdin.close()
+            with self._tts_lock:
+                self._tts_proc = proc
+            try:
+                if proc.stdin is not None:
+                    # errors="replace": clipboard text can carry lone
+                    # surrogates; a strict-encode crash here used to leave
+                    # stdin open and the child wedged in read() forever.
+                    proc.stdin.write(text.encode("utf-8", errors="replace"))
+            finally:
+                # The child blocks on stdin EOF — close no matter what.
+                try:
+                    if proc.stdin is not None:
+                        proc.stdin.close()
+                except Exception:
+                    pass
         except Exception as exc:
             msg = str(exc)[:160]
             print(f"[tts] start failed: {exc}", file=sys.stderr)
+            self._kill_tts_proc()
             callAfter(lambda: rumps.notification(
                 "Read aloud failed", "", msg
             ))
 
-    def _stop_reading(self) -> None:
-        if not EDGE_TTS_STREAM.exists():
-            callAfter(lambda: rumps.notification(
-                "Stop unavailable", "", f"Missing {EDGE_TTS_STREAM}"
-            ))
+    def _kill_tts_proc(self) -> None:
+        """Kill the playback child we spawned, hard. Safe to call anytime."""
+        with self._tts_lock:
+            proc = self._tts_proc
+            self._tts_proc = None
+        if proc is None or proc.poll() is not None:
             return
+        # Spawned with start_new_session=True, so pgid == proc.pid and the
+        # group is guaranteed not to be ours.
         try:
-            subprocess.run(
-                [str(EDGE_TTS_STREAM), "--stop"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=2,
-                check=False,
-            )
-            callAfter(lambda: rumps.notification("Reading stopped", "", ""))
-        except Exception as exc:
-            msg = str(exc)[:160]
-            print(f"[tts] stop failed: {exc}", file=sys.stderr)
-            callAfter(lambda: rumps.notification(
-                "Stop failed", "", msg
-            ))
+            os.killpg(proc.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            proc.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            try:
+                proc.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                pass
+
+    def _stop_reading(self) -> None:
+        # Three independent kill paths — any one alone silences playback,
+        # so the Stop button works even when the others are broken.
+        # 1. The child we spawned: direct group kill, no PID-file involved.
+        self._kill_tts_proc()
+        # 2. The helpers' shared PID file — catches speech started by anything
+        #    other than this app. Both helpers write the same pid file, so
+        #    either --stop kills the active playback group; call whichever
+        #    exists.
+        for helper in (EDGE_TTS_STREAM, OPENAI_TTS_STREAM):
+            if not helper.exists():
+                continue
+            try:
+                subprocess.run(
+                    [str(helper), "--stop"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=2,
+                    check=False,
+                )
+            except Exception as exc:
+                print(f"[tts] --stop failed: {exc}", file=sys.stderr)
+        # 3. Last resort: sweep stray TTS processes by command line. The
+        #    patterns include the mode flag so the --stop helper above can
+        #    never match itself.
+        for pattern in (
+            "edge-tts-stream --stdin",
+            "edge-tts-stream --text",
+            "openai-tts-stream --stdin",
+            "openai-tts-stream --text",
+            "/opt/homebrew/bin/play -t mp3",
+        ):
+            try:
+                subprocess.run(
+                    ["pkill", "-9", "-f", pattern],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=2,
+                    check=False,
+                )
+            except Exception:
+                pass
+        callAfter(lambda: rumps.notification("Reading stopped", "", ""))
 
     def on_test_voice(self, _sender) -> None:
         threading.Thread(target=self._speak_test, daemon=True).start()
 
     def _speak_test(self) -> None:
+        # For the OpenAI engine, route the sample through the normal speak
+        # path so the test exercises the exact backend that Read aloud uses.
+        if self.tts_engine == "openai" and openai_api_key():
+            self._speak_text(
+                f"This is the {self.openai_voice} voice. "
+                "Notice how warm and natural this sounds."
+            )
+            return
         import asyncio
         import edge_tts
         try:
@@ -1073,7 +1262,12 @@ class ScribeApp(rumps.App):
             tmp = f"/tmp/edgetts-v2-test-{uuid.uuid4().hex[:6]}.mp3"
             with open(tmp, "wb") as f:
                 f.write(out)
-            subprocess.run(["afplay", tmp])
+            # Track it like regular playback so Stop reading kills it too.
+            self._kill_tts_proc()
+            proc = subprocess.Popen(["afplay", tmp], start_new_session=True)
+            with self._tts_lock:
+                self._tts_proc = proc
+            proc.wait()
             os.unlink(tmp)
         except Exception as exc:
             print(f"[tts] {exc}", file=sys.stderr)

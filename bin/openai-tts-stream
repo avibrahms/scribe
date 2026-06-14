@@ -1,0 +1,360 @@
+#!/usr/bin/env python3
+"""
+Stream OpenAI text-to-speech (gpt-4o-mini-tts) with low latency and a reliable
+stop, designed as a drop-in sibling of `edge-tts-stream`.
+
+It shares the SAME pid file and the SAME audio player (sox `play`) as
+edge-tts-stream so Scribe's existing three-path stop logic silences it too.
+
+No third-party packages: the OpenAI Audio Speech REST endpoint is called with
+the standard library (urllib + ssl), and the streamed MP3 body is piped
+straight into `play -t mp3 -`.
+
+The API key is read from $OPENAI_API_KEY, or from
+~/.config/speak-selection/openai_key (0600). It is never written to the repo.
+"""
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+import urllib.request
+import urllib.error
+
+CONFIG_DIR = os.path.expanduser("~/.config/speak-selection")
+SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config")
+KEY_FILE = os.path.join(CONFIG_DIR, "openai_key")
+# Same pid file as edge-tts-stream: only one playback runs at a time, and this
+# lets `edge-tts-stream --stop` (and Scribe's stop) kill us by process group.
+PID_FILE = os.path.join(CONFIG_DIR, "speak.pid")
+
+PLAYER_CMD = ["/opt/homebrew/bin/play", "-t", "mp3", "-q", "-"]
+
+API_URL = "https://api.openai.com/v1/audio/speech"
+DEFAULT_MODEL = "gpt-4o-mini-tts"
+DEFAULT_VOICE = "coral"
+DEFAULT_INSTRUCTIONS = (
+    "Speak in a warm, natural, and expressive tone, like a friendly human "
+    "reading aloud — relaxed pacing, gentle emotion, never robotic."
+)
+# The speech endpoint caps input at 4096 chars. Stay well under, and make the
+# first chunk small so audio starts quickly, then use larger chunks.
+FIRST_CHUNK_CHARS = 700
+MAX_CHUNK_CHARS = 3200
+
+
+def stop_existing():
+    """Kill any currently running speech process group. SIGTERM first,
+    escalate to SIGKILL if the group survives."""
+    try:
+        with open(PID_FILE) as f:
+            pgid = int(f.read().strip())
+    except (OSError, ValueError):
+        return
+    if pgid != os.getpgrp():
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+        else:
+            for _ in range(10):
+                time.sleep(0.05)
+                try:
+                    os.killpg(pgid, 0)
+                except (ProcessLookupError, PermissionError):
+                    break
+            else:
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+    try:
+        os.unlink(PID_FILE)
+    except OSError:
+        pass
+
+
+def parse_args():
+    args = {"stop": False, "text": None, "stdin": False,
+            "voice": None, "instructions": None, "model": None}
+    i = 1
+    while i < len(sys.argv):
+        a = sys.argv[i]
+        if a == "--stop":
+            args["stop"] = True
+        elif a == "--stdin":
+            args["stdin"] = True
+        elif a == "--text" and i + 1 < len(sys.argv):
+            i += 1
+            args["text"] = sys.argv[i]
+        elif a.startswith("--text="):
+            args["text"] = a[7:]
+        elif a == "--voice" and i + 1 < len(sys.argv):
+            i += 1
+            args["voice"] = sys.argv[i]
+        elif a.startswith("--voice="):
+            args["voice"] = a[8:]
+        elif a == "--instructions" and i + 1 < len(sys.argv):
+            i += 1
+            args["instructions"] = sys.argv[i]
+        elif a.startswith("--instructions="):
+            args["instructions"] = a[len("--instructions="):]
+        elif a == "--model" and i + 1 < len(sys.argv):
+            i += 1
+            args["model"] = sys.argv[i]
+        elif a.startswith("--model="):
+            args["model"] = a[8:]
+        i += 1
+    return args
+
+
+def load_settings():
+    settings = {
+        "openai_voice": DEFAULT_VOICE,
+        "openai_instructions": DEFAULT_INSTRUCTIONS,
+        "openai_model": DEFAULT_MODEL,
+    }
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE) as f:
+                data = json.load(f)
+            for k in settings:
+                if data.get(k):
+                    settings[k] = data[k]
+        except Exception:
+            pass
+    return settings
+
+
+def load_api_key():
+    key = (os.environ.get("OPENAI_API_KEY") or "").strip()
+    if key:
+        return key
+    try:
+        with open(KEY_FILE) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+# --- Text cleaning for speech (mirrors edge-tts-stream) -------------------
+
+_RE_MD_IMAGE = re.compile(r'!\[([^\]]*)\]\([^)]+\)')
+_RE_MD_LINK = re.compile(r'\[([^\]]*)\]\([^)]+\)')
+_RE_HTML_TAG = re.compile(r'<[^>]+>')
+_RE_CODE_FENCE = re.compile(r'```[a-zA-Z]*')
+_RE_HEADING = re.compile(r'(?m)^#{1,6}\s+')
+_RE_BLOCKQUOTE = re.compile(r'(?m)^>\s*')
+_RE_BULLET = re.compile(r'(?m)^[\-\*]\s+')
+_RE_NUMBERED = re.compile(r'(?m)^\d+\.\s+')
+_RE_BOLD_ITALIC = re.compile(
+    r'(?<!\w)[_*]{1,3}(?!\w)|(?<!\w)[_*]{1,3}(?=\w)|(?<=\w)[_*]{1,3}(?!\w)')
+_RE_INLINE_CODE = re.compile(r'`([^`]+)`')
+_RE_HR = re.compile(r'(?m)^[\-\*_]{3,}\s*$')
+_RE_URL = re.compile(r'https?://([^\s\)\]]+)')
+_RE_NOISE = re.compile(r'[|~\\]')
+_RE_EMOJI = re.compile(
+    r'[\U0001F600-\U0001F64F'
+    r'\U0001F300-\U0001F5FF'
+    r'\U0001F680-\U0001F6FF'
+    r'\U0001F1E0-\U0001F1FF'
+    r'\U0001F900-\U0001F9FF'
+    r'\U0001FA00-\U0001FA6F'
+    r'\U0001FA70-\U0001FAFF'
+    r'\U00002702-\U000027B0'
+    r'\U0000FE00-\U0000FE0F'
+    r'\U0000200D'
+    r'\U000020E3'
+    r'\U00002600-\U000026FF'
+    r'\U00002300-\U000023FF'
+    r'\U00002B50-\U00002B55'
+    r'\U0000203C-\U00003299'
+    r']+', re.UNICODE
+)
+_RE_MULTI_SPACE = re.compile(r'[ \t]{2,}')
+_RE_MULTI_NEWLINE = re.compile(r'\n{3,}')
+
+
+def _humanize_url(match):
+    url = match.group(1).rstrip('.,;:!?')
+    url = re.sub(r'^www\.', '', url)
+    parts = url.split('/', 1)
+    domain = parts[0].replace('.', ' dot ')
+    if len(parts) > 1 and parts[1]:
+        path = parts[1].strip('/')
+        path = path.replace('_', ' ').replace('-', ' ').replace('/', ', ')
+        path = re.sub(r'\.([a-zA-Z]{2,4})$', r' dot \1', path)
+        path = re.sub(r'[?#].*', '', path)
+        if path.strip():
+            return f"{domain}, {path}"
+    return domain
+
+
+def clean_text_for_speech(text):
+    text = _RE_EMOJI.sub('', text)
+    text = _RE_MD_IMAGE.sub(r'\1', text)
+    text = _RE_MD_LINK.sub(r'\1', text)
+    text = _RE_HTML_TAG.sub('', text)
+    text = _RE_CODE_FENCE.sub('', text)
+    text = _RE_HR.sub('', text)
+    text = _RE_HEADING.sub('', text)
+    text = _RE_BLOCKQUOTE.sub('', text)
+    text = _RE_BULLET.sub('', text)
+    text = _RE_NUMBERED.sub('', text)
+    text = _RE_INLINE_CODE.sub(r'\1', text)
+    text = _RE_BOLD_ITALIC.sub('', text)
+    text = _RE_URL.sub(_humanize_url, text)
+    text = re.sub(r'(?<=\w)_(?=\w)', ' ', text)
+    text = _RE_NOISE.sub('', text)
+    text = re.sub(r'(?<!\w)#(?!\w)', '', text)
+    text = _RE_MULTI_SPACE.sub(' ', text)
+    text = _RE_MULTI_NEWLINE.sub('\n\n', text)
+    return text.strip()
+
+
+_RE_SENTENCE = re.compile(r'(.+?(?:[.!?。！？\n]+|$))', re.S)
+
+
+def chunk_text(text):
+    """Split into <=MAX_CHUNK_CHARS pieces at sentence boundaries. The first
+    piece is kept small so the first audio arrives quickly."""
+    sentences = [s for s in _RE_SENTENCE.findall(text) if s.strip()]
+    chunks = []
+    buf = ""
+    limit = FIRST_CHUNK_CHARS
+    for s in sentences:
+        # A single oversized sentence: flush, then hard-split it.
+        if len(s) > limit and not buf:
+            for j in range(0, len(s), limit):
+                chunks.append(s[j:j + limit])
+            limit = MAX_CHUNK_CHARS
+            continue
+        if len(buf) + len(s) > limit:
+            if buf:
+                chunks.append(buf)
+            buf = s
+            limit = MAX_CHUNK_CHARS
+        else:
+            buf += s
+    if buf.strip():
+        chunks.append(buf)
+    return [c.strip() for c in chunks if c.strip()]
+
+
+def stream_tts(text, voice, instructions, model, api_key):
+    """Stream OpenAI TTS audio for each chunk into one continuous player."""
+    player = subprocess.Popen(PLAYER_CMD, stdin=subprocess.PIPE)
+    try:
+        for chunk in chunk_text(text):
+            payload = json.dumps({
+                "model": model,
+                "voice": voice,
+                "input": chunk,
+                "instructions": instructions,
+                "response_format": "mp3",
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                API_URL,
+                data=payload,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    while True:
+                        block = resp.read(8192)
+                        if not block:
+                            break
+                        player.stdin.write(block)
+                        player.stdin.flush()
+            except urllib.error.HTTPError as e:
+                detail = ""
+                try:
+                    detail = e.read().decode("utf-8", "replace")[:300]
+                except Exception:
+                    pass
+                print(f"[openai-tts] HTTP {e.code}: {detail}", file=sys.stderr)
+                break
+            except urllib.error.URLError as e:
+                print(f"[openai-tts] network error: {e}", file=sys.stderr)
+                break
+        try:
+            player.stdin.close()
+        except Exception:
+            pass
+        player.wait()
+    except BrokenPipeError:
+        pass
+    except Exception as exc:
+        print(f"[openai-tts] {exc}", file=sys.stderr)
+    finally:
+        try:
+            if player.stdin and not player.stdin.closed:
+                player.stdin.close()
+        except Exception:
+            pass
+        if player.poll() is None:
+            player.kill()
+            player.wait()
+
+
+def main():
+    args = parse_args()
+
+    if args["stop"]:
+        stop_existing()
+        return
+
+    stop_existing()
+
+    try:
+        os.setpgrp()
+    except OSError:
+        pass
+
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(PID_FILE, "w") as f:
+        f.write(str(os.getpgid(0)))
+
+    try:
+        if args["stdin"]:
+            args["text"] = sys.stdin.read()
+        if not args["text"]:
+            return
+
+        api_key = load_api_key()
+        if not api_key:
+            print("[openai-tts] no API key (set OPENAI_API_KEY or "
+                  f"{KEY_FILE})", file=sys.stderr)
+            return
+
+        settings = load_settings()
+        voice = args["voice"] or settings["openai_voice"]
+        instructions = args["instructions"] or settings["openai_instructions"]
+        model = args["model"] or settings["openai_model"]
+
+        text = clean_text_for_speech(args["text"])
+        if not text:
+            return
+
+        try:
+            stream_tts(text, voice, instructions, model, api_key)
+        except (KeyboardInterrupt, SystemExit):
+            pass
+    finally:
+        try:
+            with open(PID_FILE) as f:
+                if int(f.read().strip()) == os.getpgid(0):
+                    os.unlink(PID_FILE)
+        except (OSError, ValueError):
+            pass
+
+
+if __name__ == "__main__":
+    main()

@@ -26,7 +26,11 @@ Wispr Flow is great, but it's **$12/month**, proprietary, and sends your audio a
 ## How it works
 
 - **STT (dictation)**: hold a modifier key (default: Right ⌥/Alt) → record via `sounddevice` → send WAV to **Groq's free Whisper API** (`whisper-large-v3-turbo`) → snapshot the clipboard → paste the transcript → restore your clipboard.
-- **TTS (read-aloud)**: any selected text → **Microsoft Edge TTS voices** (Ava, Andrew, Brian, Emma, William, Sonia, Natasha, Denise, Elvira, Katja, Elsa, etc.) → no API key required, free, unlimited.
+- **TTS (read-aloud)**: any selected text → choose your engine from the menu (**TTS Engine**):
+  - **OpenAI** (default) — `gpt-4o-mini-tts`: very natural, emotionally expressive voices (Coral, Nova, Shimmer, Sage, Ash, Onyx, Fable, …). Needs an OpenAI API key (set it via *Set OpenAI API key…*); costs ~$0.015/min.
+  - **Microsoft Edge** — free, unlimited Edge neural voices (Ava, Andrew, Brian, Emma, William, Sonia, Natasha, Denise, Elvira, Katja, Elsa, etc.), no API key.
+
+  The engine and per-engine voice are remembered across relaunch. Keys are stored only in the gitignored `.env` and a `0600` file under `~/.config/speak-selection/` — never committed.
 - **Hotkey observation**: a listen-only global key watcher (`CGEventTap` on macOS, `pynput` on Windows) — never intercepts or blocks keystrokes.
 - **Persistence**: auto-starts at login (`launchd` on macOS, Startup-folder shortcut on Windows).
 
@@ -129,7 +133,7 @@ Windows has no TCC/permissions system to grant — Scribe just works. Caveats:
 ## Privacy
 
 - Audio: sent to `api.groq.com` for transcription. Groq's policy is on [their site](https://groq.com/privacy-policy/).
-- TTS text: sent to Microsoft's Edge read-aloud endpoint.
+- TTS text: sent to the selected engine — Microsoft's Edge read-aloud endpoint (free) or OpenAI's `api.openai.com` (when the OpenAI engine is selected).
 - Nothing else leaves your machine. No analytics, no crash reporting, no phone-home.
 - Transcript history is stored locally as plain JSON Lines — easy to grep or delete.
 

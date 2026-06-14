@@ -299,6 +299,152 @@ def save_voice(voice: str) -> None:
     SETTINGS_FILE.write_text(json.dumps(settings, indent=2))
 
 
+# ---------- TTS engine selection (Edge vs OpenAI) ------------------------
+# Two backends, switchable from the menu, choice persisted across relaunch.
+#   • "edge"   — free Microsoft Edge neural voices (no key, see VOICES)
+#   • "openai" — gpt-4o-mini-tts, natural + steerable emotion (needs a key)
+
+TTS_ENGINES = ("openai", "edge")
+DEFAULT_TTS_ENGINE = "openai"
+
+OPENAI_TTS_MODEL = "gpt-4o-mini-tts"
+DEFAULT_OPENAI_VOICE = "coral"
+DEFAULT_TTS_INSTRUCTIONS = (
+    "Speak in a warm, natural, and expressive tone, like a friendly human "
+    "reading aloud — relaxed pacing, gentle emotion, never robotic."
+)
+
+# Curated gpt-4o-mini-tts voices (label, id). All support emotion steering.
+OPENAI_VOICES: list[tuple[str, str]] = [
+    ("Coral · warm, expressive",  "coral"),
+    ("Nova · bright female",      "nova"),
+    ("Shimmer · soft female",     "shimmer"),
+    ("Sage · calm female",        "sage"),
+    ("Alloy · neutral",           "alloy"),
+    ("Ash · natural male",        "ash"),
+    ("Ballad · gentle male",      "ballad"),
+    ("Echo · clear male",         "echo"),
+    ("Onyx · deep male",          "onyx"),
+    ("Fable · storyteller",       "fable"),
+]
+
+
+def load_tts_engine() -> str:
+    cfg = load_cfg()
+    eng = str(cfg.get("tts_engine", "")).strip().lower()
+    return eng if eng in TTS_ENGINES else DEFAULT_TTS_ENGINE
+
+
+def save_tts_engine(engine: str) -> None:
+    engine = engine.strip().lower()
+    if engine not in TTS_ENGINES:
+        return
+    cfg = load_cfg()
+    cfg["tts_engine"] = engine
+    save_cfg(cfg)
+    _write_speak_settings(engine=engine)
+
+
+def load_openai_voice() -> str:
+    cfg = load_cfg()
+    v = str(cfg.get("openai_voice", "")).strip()
+    return v or DEFAULT_OPENAI_VOICE
+
+
+def save_openai_voice(voice: str) -> None:
+    voice = voice.strip()
+    if not voice:
+        return
+    cfg = load_cfg()
+    cfg["openai_voice"] = voice
+    save_cfg(cfg)
+    _write_speak_settings(openai_voice=voice)
+
+
+def load_tts_instructions() -> str:
+    cfg = load_cfg()
+    v = str(cfg.get("openai_instructions", "")).strip()
+    return v or DEFAULT_TTS_INSTRUCTIONS
+
+
+def save_tts_instructions(text: str) -> None:
+    text = text.strip() or DEFAULT_TTS_INSTRUCTIONS
+    cfg = load_cfg()
+    cfg["openai_instructions"] = text
+    save_cfg(cfg)
+    _write_speak_settings(openai_instructions=text)
+
+
+def _write_speak_settings(**fields) -> None:
+    """Mirror OpenAI TTS prefs into the speak-selection settings.json so the
+    standalone `openai-tts-stream` helper (and any external hotkey) sees them."""
+    settings = {}
+    if SETTINGS_FILE.exists():
+        try:
+            settings = json.loads(SETTINGS_FILE.read_text())
+        except Exception:
+            settings = {}
+    # Ensure the helper always has sane values present.
+    settings.setdefault("openai_voice", DEFAULT_OPENAI_VOICE)
+    settings.setdefault("openai_instructions", DEFAULT_TTS_INSTRUCTIONS)
+    settings.setdefault("openai_model", OPENAI_TTS_MODEL)
+    for k, v in fields.items():
+        if v is not None:
+            settings[k] = v
+    try:
+        SETTINGS_FILE.write_text(json.dumps(settings, indent=2))
+    except Exception:
+        pass
+
+
+def openai_api_key() -> str:
+    k = (os.environ.get("OPENAI_API_KEY") or "").strip()
+    if k:
+        return k
+    # Standalone key file (0600), shared with the helper.
+    try:
+        kf = SPEAK_SELECTION_DIR / "openai_key"
+        if kf.exists():
+            return kf.read_text().strip()
+    except Exception:
+        pass
+    cfg = load_cfg()
+    return str(cfg.get("openai_api_key", "")).strip()
+
+
+def save_openai_key(key: str) -> None:
+    """Persist the OpenAI key OUT of the repo: the app's gitignored .env (so
+    the running app inherits it via env) plus a 0600 key file for the helper."""
+    key = key.strip()
+    if not key:
+        return
+    # .env upsert (mirrors save_groq_key_to_dotenv).
+    existing = DOTENV_FILE.read_text().splitlines() if DOTENV_FILE.exists() else []
+    out, replaced = [], False
+    for line in existing:
+        if line.strip().startswith("OPENAI_API_KEY="):
+            out.append(f"OPENAI_API_KEY={key}")
+            replaced = True
+        else:
+            out.append(line)
+    if not replaced:
+        out.append(f"OPENAI_API_KEY={key}")
+    DOTENV_FILE.write_text("\n".join(out) + "\n")
+    try:
+        os.chmod(DOTENV_FILE, 0o600)
+    except Exception:
+        pass
+    # 0600 standalone key file.
+    try:
+        kf = SPEAK_SELECTION_DIR / "openai_key"
+        kf.write_text(key)
+        os.chmod(kf, 0o600)
+    except Exception:
+        pass
+    # Make it live in this process immediately.
+    os.environ["OPENAI_API_KEY"] = key
+
+
 # ---------- audio recorder ------------------------------------------------
 
 import threading  # noqa: E402  (grouped with Recorder which needs it)
