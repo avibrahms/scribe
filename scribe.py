@@ -66,6 +66,8 @@ from scribe_core import (
     DEFAULT_VOICE,
     OPENAI_VOICES,
     OPENAI_TTS_MODEL,
+    OPENAI_MODELS,
+    DEFAULT_TTS_INSTRUCTIONS,
     Recorder,
     load_dotenv as _load_dotenv,
     append_history,
@@ -84,6 +86,15 @@ from scribe_core import (
     load_openai_voice,
     save_openai_voice,
     load_tts_instructions,
+    save_tts_instructions,
+    load_openai_model,
+    save_openai_model,
+    load_openai_speed,
+    save_openai_speed,
+    load_edge_rate,
+    load_edge_pitch,
+    load_edge_volume,
+    save_edge_prosody,
     openai_api_key,
     save_openai_key,
     transcribe,
@@ -134,6 +145,95 @@ _load_dotenv(DOTENV_FILE)
 
 EDGE_TTS_STREAM = Path.home() / "bin" / "edge-tts-stream"
 OPENAI_TTS_STREAM = Path.home() / "bin" / "openai-tts-stream"
+
+
+# ---------- TTS tuning presets (menu-driven, all persisted) ---------------
+# Every tweakable parameter for each engine is exposed in the menu bar with a
+# curated set of presets plus a "Custom…" entry for exact values. Nothing here
+# requires touching code — selecting an item persists it and the helpers pick
+# it up on the next utterance.
+
+OPENAI_SPEED_PRESETS = [
+    ("0.5× — very slow", 0.5), ("0.75× — slow", 0.75), ("0.9×", 0.9),
+    ("1.0× — normal", 1.0), ("1.1×", 1.1), ("1.25× — brisk", 1.25),
+    ("1.5× — fast", 1.5), ("2.0× — very fast", 2.0),
+]
+
+EDGE_RATE_PRESETS = [
+    ("-50% — very slow", "-50%"), ("-25% — slow", "-25%"), ("-10%", "-10%"),
+    ("+0% — normal", "+0%"), ("+10%", "+10%"), ("+25% — brisk", "+25%"),
+    ("+50% — fast", "+50%"), ("+100% — very fast", "+100%"),
+]
+
+EDGE_PITCH_PRESETS = [
+    ("-50Hz — deep", "-50Hz"), ("-25Hz", "-25Hz"), ("-10Hz", "-10Hz"),
+    ("+0Hz — normal", "+0Hz"), ("+10Hz", "+10Hz"), ("+25Hz", "+25Hz"),
+    ("+50Hz — high", "+50Hz"),
+]
+
+EDGE_VOLUME_PRESETS = [
+    ("-50% — quiet", "-50%"), ("-25%", "-25%"), ("+0% — normal", "+0%"),
+    ("+25%", "+25%"), ("+50% — loud", "+50%"), ("+100% — max", "+100%"),
+]
+
+# Named emotion/tone presets for gpt-4o-mini-tts. The value is the full
+# `instructions` string the model is steered with; "Custom…" lets the user
+# type their own. The first entry mirrors the shared default.
+EMOTION_PRESETS = [
+    ("Expressive storyteller (default)", DEFAULT_TTS_INSTRUCTIONS),
+    ("Calm & soothing",
+     "Read in a calm, soothing, gentle voice. Keep the pace slow and "
+     "relaxed, the tone soft, warm and reassuring, with smooth, unhurried "
+     "delivery and a peaceful, comforting feel throughout."),
+    ("Energetic & upbeat",
+     "Read with high, bouncy energy — fast-paced, enthusiastic and lively. "
+     "Use big dynamic range, bright rising intonation, and an excited, "
+     "infectious, can't-wait-to-tell-you delivery."),
+    ("Warm & friendly",
+     "Read in a warm, friendly, conversational tone, as if chatting with a "
+     "close friend. Relaxed, kind and natural, with gentle emotional "
+     "inflection and an easy, genuine smile in the voice."),
+    ("Professional newscaster",
+     "Read like a polished news anchor: clear, confident, articulate and "
+     "authoritative. Measured pacing, crisp diction and composed, credible "
+     "delivery — engaged but never theatrical."),
+    ("Dramatic & theatrical",
+     "Perform with theatrical drama. Use big emotional swings, suspenseful "
+     "pauses, intense highs and hushed lows, and rich expressive colour, as "
+     "if narrating a gripping story on stage."),
+]
+
+
+def _parse_speed(raw: str):
+    """'1.25', '1.25×', '2' -> clamped float, or None if not a number."""
+    raw = raw.strip().rstrip("×x").strip()
+    try:
+        return min(4.0, max(0.25, round(float(raw), 2)))
+    except ValueError:
+        return None
+
+
+def _parse_percent(raw: str):
+    """'25', '+25%', '-10' -> normalized '+25%'/'-10%', or None."""
+    raw = raw.strip().rstrip("%").strip()
+    try:
+        n = int(round(float(raw)))
+    except ValueError:
+        return None
+    n = max(-100, min(200, n))
+    return f"{n:+d}%"
+
+
+def _parse_hertz(raw: str):
+    """'20', '+20Hz', '-15hz' -> normalized '+20Hz'/'-15Hz', or None."""
+    raw = raw.strip()
+    raw = re.sub(r"(?i)hz$", "", raw).strip()
+    try:
+        n = int(round(float(raw)))
+    except ValueError:
+        return None
+    n = max(-100, min(100, n))
+    return f"{n:+d}Hz"
 
 
 # ---------- helpers: foreground activation --------------------------------
@@ -596,6 +696,13 @@ class ScribeApp(rumps.App):
         self.current_voice = load_voice()
         self.tts_engine = load_tts_engine()
         self.openai_voice = load_openai_voice()
+        # All menu-tweakable TTS params, persisted across relaunch.
+        self.openai_model = load_openai_model()
+        self.openai_speed = load_openai_speed()
+        self.openai_instructions = load_tts_instructions()
+        self.edge_rate = load_edge_rate()
+        self.edge_pitch = load_edge_pitch()
+        self.edge_volume = load_edge_volume()
         self.hotkey_id = load_hotkey_id()
 
         self._build_menu()
@@ -639,16 +746,35 @@ class ScribeApp(rumps.App):
                 mi.state = 1
             self.engine_menu.add(mi)
 
-        # OpenAI voice picker (used when the OpenAI engine is selected).
-        self.openai_voice_menu = rumps.MenuItem("OpenAI Voice")
+        # --- OpenAI TTS: voice + every tunable, all in one submenu --------
+        self.openai_menu = rumps.MenuItem("OpenAI TTS — tuning")
+        #   Voice
+        self.openai_voice_menu = rumps.MenuItem("Voice")
         for label, voice_id in OPENAI_VOICES:
             item = rumps.MenuItem(label, callback=self._make_openai_voice_cb(voice_id))
             if voice_id == self.openai_voice:
                 item.state = 1
             self.openai_voice_menu.add(item)
+        self.openai_menu.add(self.openai_voice_menu)
+        #   Emotion / tone (the steering instructions — biggest lever)
+        self.openai_menu.add(self._build_emotion_menu())
+        #   Speed
+        self.openai_menu.add(self._build_choice_menu(
+            "Speed", OPENAI_SPEED_PRESETS,
+            lambda: self.openai_speed, self._set_openai_speed,
+            fmt=lambda v: f"{float(v):g}×",
+            custom={"title": "OpenAI speed",
+                    "message": "Playback speed multiplier (0.25 – 4.0).",
+                    "parse": _parse_speed}))
+        #   Model
+        self.openai_menu.add(self._build_choice_menu(
+            "Model", OPENAI_MODELS,
+            lambda: self.openai_model, self._set_openai_model))
 
-        # Edge voice picker (used when the Edge engine is selected).
-        self.voice_menu = rumps.MenuItem("Edge Voice")
+        # --- Microsoft Edge TTS: voice + every tunable --------------------
+        self.edge_menu = rumps.MenuItem("Microsoft Edge TTS — tuning")
+        #   Voice (language-grouped tree)
+        self.voice_menu = rumps.MenuItem("Voice")
         for lang, voices in VOICES.items():
             sub = rumps.MenuItem(lang)
             for label, voice_id in voices:
@@ -660,6 +786,28 @@ class ScribeApp(rumps.App):
                     item.state = 1
                 sub.add(item)
             self.voice_menu.add(sub)
+        self.edge_menu.add(self.voice_menu)
+        #   Speed (rate)
+        self.edge_menu.add(self._build_choice_menu(
+            "Speed", EDGE_RATE_PRESETS,
+            lambda: self.edge_rate, self._set_edge_rate,
+            custom={"title": "Edge speed",
+                    "message": "Rate as a percentage, e.g. +25% or -10%.",
+                    "parse": _parse_percent}))
+        #   Pitch
+        self.edge_menu.add(self._build_choice_menu(
+            "Pitch", EDGE_PITCH_PRESETS,
+            lambda: self.edge_pitch, self._set_edge_pitch,
+            custom={"title": "Edge pitch",
+                    "message": "Pitch shift in Hz, e.g. +20Hz or -15Hz.",
+                    "parse": _parse_hertz}))
+        #   Volume
+        self.edge_menu.add(self._build_choice_menu(
+            "Volume", EDGE_VOLUME_PRESETS,
+            lambda: self.edge_volume, self._set_edge_volume,
+            custom={"title": "Edge volume",
+                    "message": "Volume as a percentage, e.g. +50% or -25%.",
+                    "parse": _parse_percent}))
 
         # Text-to-speech actions
         self.read_selected_item = rumps.MenuItem(
@@ -724,8 +872,8 @@ class ScribeApp(rumps.App):
             self.status_item,
             None,
             self.engine_menu,
-            self.openai_voice_menu,
-            self.voice_menu,
+            self.openai_menu,
+            self.edge_menu,
             self.read_selected_item,
             self.read_copied_item,
             self.stop_reading_item,
@@ -815,6 +963,148 @@ class ScribeApp(rumps.App):
             save_openai_voice(voice_id)
             rumps.notification("OpenAI voice set", voice_id, "")
         return cb
+
+    # -- generic "pick a value" submenu builder ---------------------------
+    # Used for every numeric/enum TTS parameter. Shows a live "now: X" header,
+    # one checkable item per preset, and an optional "Custom…" entry that pops
+    # a text box for an exact value. on_pick(value) persists + applies it.
+    def _build_choice_menu(self, title, options, get_current, on_pick,
+                           *, fmt=str, custom=None):
+        menu = rumps.MenuItem(title)
+        header = rumps.MenuItem(f"  now: {fmt(get_current())}")
+        header.set_callback(None)
+        menu.add(header)
+        menu.add(None)
+
+        items: list[tuple[object, rumps.MenuItem]] = []
+        cur = get_current()
+
+        def refresh(new_val):
+            header.title = f"  now: {fmt(new_val)}"
+            for val, it in items:
+                it.state = 1 if str(val) == str(new_val) else 0
+
+        def make_cb(value):
+            def cb(_sender):
+                on_pick(value)
+                refresh(value)
+            return cb
+
+        for label, value in options:
+            it = rumps.MenuItem(label, callback=make_cb(value))
+            if str(value) == str(cur):
+                it.state = 1
+            menu.add(it)
+            items.append((value, it))
+
+        if custom:
+            menu.add(None)
+
+            def custom_cb(_sender):
+                with _foreground_app():
+                    win = rumps.Window(
+                        title=custom["title"],
+                        message=custom["message"],
+                        default_text=str(get_current()),
+                        ok="Save", cancel="Cancel",
+                        dimensions=(220, 24),
+                    )
+                    resp = win.run()
+                if not resp.clicked:
+                    return
+                value = custom["parse"](resp.text)
+                if value is None:
+                    rumps.notification(custom["title"], "Invalid value",
+                                       resp.text.strip())
+                    return
+                on_pick(value)
+                refresh(value)
+
+            menu.add(rumps.MenuItem("Custom…", callback=custom_cb))
+        return menu
+
+    # -- emotion / tone submenu (gpt-4o-mini-tts instructions) -------------
+    def _build_emotion_menu(self):
+        menu = rumps.MenuItem("Emotion / tone")
+        preset_items: list[tuple[str, rumps.MenuItem]] = []
+
+        def mark(active_text):
+            matched = False
+            for text, it in preset_items:
+                on = text.strip() == (active_text or "").strip()
+                it.state = 1 if on else 0
+                matched = matched or on
+            self._emotion_custom_item.state = 0 if matched else 1
+
+        def make_cb(text):
+            def cb(_sender):
+                self._set_instructions(text)
+                mark(text)
+            return cb
+
+        for label, text in EMOTION_PRESETS:
+            it = rumps.MenuItem(label, callback=make_cb(text))
+            menu.add(it)
+            preset_items.append((text, it))
+
+        menu.add(None)
+
+        def custom_cb(_sender):
+            with _foreground_app():
+                win = rumps.Window(
+                    title="Custom emotion / tone",
+                    message="Describe exactly how the voice should perform "
+                            "(tone, emotion, pacing, accent). gpt-4o-mini-tts "
+                            "follows this instruction.",
+                    default_text=self.openai_instructions,
+                    ok="Save", cancel="Cancel",
+                    dimensions=(380, 130),
+                )
+                resp = win.run()
+            if not resp.clicked:
+                return
+            text = resp.text.strip()
+            if not text:
+                return
+            self._set_instructions(text)
+            mark(text)
+
+        self._emotion_custom_item = rumps.MenuItem("Custom…", callback=custom_cb)
+        menu.add(self._emotion_custom_item)
+        # Initial check state reflects the persisted instruction.
+        mark(self.openai_instructions)
+        return menu
+
+    # -- setters: persist + apply, shared by presets and Custom… ----------
+    def _set_openai_model(self, model: str) -> None:
+        self.openai_model = model
+        save_openai_model(model)
+        rumps.notification("OpenAI model", model, "")
+
+    def _set_openai_speed(self, speed: float) -> None:
+        self.openai_speed = float(speed)
+        save_openai_speed(speed)
+        rumps.notification("OpenAI speed", f"{float(speed):g}×", "")
+
+    def _set_instructions(self, text: str) -> None:
+        self.openai_instructions = text
+        save_tts_instructions(text)
+        rumps.notification("OpenAI emotion / tone updated", "", text[:90])
+
+    def _set_edge_rate(self, rate: str) -> None:
+        self.edge_rate = rate
+        save_edge_prosody(rate=rate)
+        rumps.notification("Edge speed", rate, "")
+
+    def _set_edge_pitch(self, pitch: str) -> None:
+        self.edge_pitch = pitch
+        save_edge_prosody(pitch=pitch)
+        rumps.notification("Edge pitch", pitch, "")
+
+    def _set_edge_volume(self, volume: str) -> None:
+        self.edge_volume = volume
+        save_edge_prosody(volume=volume)
+        rumps.notification("Edge volume", volume, "")
 
     def _make_lang_cb(self, code: str):
         def cb(sender: rumps.MenuItem) -> None:
@@ -1121,7 +1411,13 @@ class ScribeApp(rumps.App):
             key = openai_api_key()
             if key:
                 env["OPENAI_API_KEY"] = key
-            cmd += ["--voice", self.openai_voice]
+            # Voice/speed/model explicit; instructions ride along in
+            # settings.json (mirrored on every save) to keep argv small.
+            cmd += [
+                "--voice", self.openai_voice,
+                "--speed", str(self.openai_speed),
+                "--model", self.openai_model,
+            ]
 
         # Replace any playback we already own before starting a new one.
         self._kill_tts_proc()
@@ -1252,6 +1548,9 @@ class ScribeApp(rumps.App):
                 c = edge_tts.Communicate(
                     f"This is {self.current_voice.split('-')[-1].replace('Neural','')}. Hello.",
                     self.current_voice,
+                    rate=self.edge_rate,
+                    pitch=self.edge_pitch,
+                    volume=self.edge_volume,
                 )
                 async for chunk in c.stream():
                     if chunk["type"] == "audio":

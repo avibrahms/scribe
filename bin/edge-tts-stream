@@ -1,0 +1,444 @@
+#!/Users/avi/.local/pipx/venvs/edge-tts/bin/python
+"""
+Stream edge-tts audio with minimal latency and reliable stop.
+
+Uses process groups and a PID file for clean stop from any source.
+"""
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+
+CONFIG_DIR = os.path.expanduser("~/.config/speak-selection")
+SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config")
+PID_FILE = os.path.join(CONFIG_DIR, "speak.pid")
+
+PLAYER_CMD = ["/opt/homebrew/bin/play", "-t", "mp3", "-q", "-"]
+
+
+def stop_existing():
+    """Kill any currently running speech process group. SIGTERM first,
+    escalate to SIGKILL if the group survives."""
+    try:
+        with open(PID_FILE) as f:
+            pgid = int(f.read().strip())
+    except (OSError, ValueError):
+        return
+    # Never kill our own group: a stale/corrupt PID file pointing at the
+    # caller's group would otherwise take down the menubar app itself.
+    if pgid != os.getpgrp():
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+        else:
+            for _ in range(10):
+                time.sleep(0.05)
+                try:
+                    os.killpg(pgid, 0)
+                except (ProcessLookupError, PermissionError):
+                    break
+            else:
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+    try:
+        os.unlink(PID_FILE)
+    except OSError:
+        pass
+
+
+def parse_args():
+    """Fast arg parsing without argparse."""
+    args = {"stop": False, "text": None, "stdin": False, "voice": None,
+            "rate": None, "pitch": None, "volume": None}
+    i = 1
+    while i < len(sys.argv):
+        a = sys.argv[i]
+        if a == "--stop":
+            args["stop"] = True
+        elif a == "--stdin":
+            args["stdin"] = True
+        elif a == "--text" and i + 1 < len(sys.argv):
+            i += 1
+            args["text"] = sys.argv[i]
+        elif a.startswith("--text="):
+            args["text"] = a[7:]
+        elif a == "--voice" and i + 1 < len(sys.argv):
+            i += 1
+            args["voice"] = sys.argv[i]
+        elif a.startswith("--voice="):
+            args["voice"] = a[8:]
+        elif a == "--rate" and i + 1 < len(sys.argv):
+            i += 1
+            args["rate"] = sys.argv[i]
+        elif a.startswith("--rate="):
+            args["rate"] = a[7:]
+        elif a == "--pitch" and i + 1 < len(sys.argv):
+            i += 1
+            args["pitch"] = sys.argv[i]
+        elif a.startswith("--pitch="):
+            args["pitch"] = a[8:]
+        elif a == "--volume" and i + 1 < len(sys.argv):
+            i += 1
+            args["volume"] = sys.argv[i]
+        elif a.startswith("--volume="):
+            args["volume"] = a[9:]
+        i += 1
+    return args
+
+
+def load_settings():
+    """Load voice/rate/pitch/volume from config."""
+    settings = {"voice": "en-US-BrianNeural", "rate": "+0%",
+                "pitch": "+0Hz", "volume": "+0%"}
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE) as f:
+                settings.update(json.load(f))
+        except Exception:
+            pass
+    elif os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE) as f:
+                for line in f:
+                    line = line.strip()
+                    if "=" in line and not line.startswith("#"):
+                        key, val = line.split("=", 1)
+                        key = key.strip().lower()
+                        val = val.strip().strip('"').strip("'")
+                        if key in settings:
+                            settings[key] = val
+        except Exception:
+            pass
+    return settings
+
+
+# --- Text cleaning for speech (compiled once at import) ---
+
+# Markdown images ![alt](url) -> alt text only
+_RE_MD_IMAGE = re.compile(r'!\[([^\]]*)\]\([^)]+\)')
+# Markdown links [text](url) -> text only
+_RE_MD_LINK = re.compile(r'\[([^\]]*)\]\([^)]+\)')
+# HTML tags
+_RE_HTML_TAG = re.compile(r'<[^>]+>')
+# Code fences (``` optionally with language)
+_RE_CODE_FENCE = re.compile(r'```[a-zA-Z]*')
+# Heading markers at start of line (# ## ### etc)
+_RE_HEADING = re.compile(r'(?m)^#{1,6}\s+')
+# Blockquote markers at start of line
+_RE_BLOCKQUOTE = re.compile(r'(?m)^>\s*')
+# Bullet/list markers at start of line (- or * followed by space)
+_RE_BULLET = re.compile(r'(?m)^[\-\*]\s+')
+# Numbered list markers at start of line (1. 2. etc)
+_RE_NUMBERED = re.compile(r'(?m)^\d+\.\s+')
+# Bold/italic markers (*** ** * ___ __ but NOT underscores inside words)
+_RE_BOLD_ITALIC = re.compile(r'(?<!\w)[_*]{1,3}(?!\w)|(?<!\w)[_*]{1,3}(?=\w)|(?<=\w)[_*]{1,3}(?!\w)')
+# Inline code backticks
+_RE_INLINE_CODE = re.compile(r'`([^`]+)`')
+# Horizontal rules (--- *** ___ on their own line)
+_RE_HR = re.compile(r'(?m)^[\-\*_]{3,}\s*$')
+# URLs: https://example.com/some_path -> "example dot com, some path"
+_RE_URL = re.compile(r'https?://([^\s\)\]]+)')
+# Remaining noisy characters (pipes, tildes, backslashes)
+_RE_NOISE = re.compile(r'[|~\\]')
+# Emojis and pictographic symbols (Unicode blocks for emoji)
+_RE_EMOJI = re.compile(
+    r'[\U0001F600-\U0001F64F'   # emoticons
+    r'\U0001F300-\U0001F5FF'    # misc symbols & pictographs
+    r'\U0001F680-\U0001F6FF'    # transport & map symbols
+    r'\U0001F1E0-\U0001F1FF'    # flags
+    r'\U0001F900-\U0001F9FF'    # supplemental symbols
+    r'\U0001FA00-\U0001FA6F'    # chess symbols, extended-A
+    r'\U0001FA70-\U0001FAFF'    # symbols extended-A continued
+    r'\U00002702-\U000027B0'    # dingbats
+    r'\U0000FE00-\U0000FE0F'    # variation selectors
+    r'\U0000200D'               # zero width joiner
+    r'\U000020E3'               # combining enclosing keycap
+    r'\U00002600-\U000026FF'    # misc symbols (☀⚠☎ etc)
+    r'\U00002300-\U000023FF'    # misc technical (⌘⌛ etc)
+    r'\U00002B50-\U00002B55'    # stars, circles
+    r'\U0000203C-\U00003299'    # CJK symbols, enclosed chars
+    r']+', re.UNICODE
+)
+# Collapse multiple spaces/newlines
+_RE_MULTI_SPACE = re.compile(r'[ \t]{2,}')
+_RE_MULTI_NEWLINE = re.compile(r'\n{3,}')
+
+
+def _humanize_url(match):
+    """Turn a URL into something speakable."""
+    url = match.group(1)
+    # Strip trailing punctuation that's not part of the URL
+    url = url.rstrip('.,;:!?')
+    # Remove common prefixes
+    url = re.sub(r'^www\.', '', url)
+    # Split path from domain
+    parts = url.split('/', 1)
+    domain = parts[0]
+    # Domain: replace dots with " dot "
+    domain = domain.replace('.', ' dot ')
+    if len(parts) > 1 and parts[1]:
+        path = parts[1]
+        # Clean path: drop trailing slashes, replace separators with spaces
+        path = path.strip('/')
+        path = path.replace('_', ' ').replace('-', ' ').replace('/', ', ')
+        # File extensions: .md -> " dot md", .py -> " dot py"
+        path = re.sub(r'\.([a-zA-Z]{2,4})$', r' dot \1', path)
+        # Drop query strings and fragments
+        path = re.sub(r'[?#].*', '', path)
+        if path.strip():
+            return f"{domain}, {path}"
+    return domain
+
+
+def _format_table_for_speech(text):
+    """Detect tables and reformat them for natural flowing narration.
+
+    Reads headers once, then each row as a concise sentence:
+      2 cols: "Table: Name and Age. Alice, 30. Bob, 25."
+      3+ cols: "Table: Feature, Free, and Pro. Storage: Free 5GB, Pro 50GB."
+    """
+    lines = text.split('\n')
+    result = []
+    i = 0
+
+    def _header_intro(headers):
+        """Natural header list with Oxford comma."""
+        if len(headers) == 1:
+            return headers[0]
+        if len(headers) == 2:
+            return f"{headers[0]} and {headers[1]}"
+        return ', '.join(headers[:-1]) + f', and {headers[-1]}'
+
+    def _narrate_rows(headers, table_lines, split_fn):
+        """Convert table rows into flowing speech."""
+        n_cols = len(headers)
+        result.append(f"Table: {_header_intro(headers)}.")
+        result.append('')
+
+        for row_line in table_lines:
+            cells = split_fn(row_line)
+            while len(cells) < n_cols:
+                cells.append('')
+            cells = cells[:n_cols]
+
+            non_empty = [(h, c) for h, c in zip(headers, cells) if c]
+            if not non_empty:
+                continue
+
+            if n_cols <= 2:
+                # Short table: just list values, headers implied from intro
+                result.append(', '.join(c for _, c in non_empty) + '.')
+            else:
+                # Wider table: first cell anchors, rest get header prefix
+                first_val = non_empty[0][1]
+                rest = [f"{h} {c}" for h, c in non_empty[1:]]
+                if rest:
+                    result.append(f"{first_val}: {', '.join(rest)}.")
+                else:
+                    result.append(f"{first_val}.")
+            result.append('')
+
+    while i < len(lines):
+        line = lines[i].strip()
+
+        # Detect markdown table: line with | delimiters
+        if '|' in line and line.count('|') >= 2:
+            table_lines = []
+            while i < len(lines):
+                l = lines[i].strip()
+                if '|' not in l or l.count('|') < 2:
+                    break
+                table_lines.append(l)
+                i += 1
+
+            if len(table_lines) >= 2:
+                headers = [c.strip() for c in table_lines[0].strip('|').split('|')]
+                headers = [h for h in headers if h]
+
+                # Skip separator row (e.g., |---|---|)
+                data_start = 1
+                if data_start < len(table_lines):
+                    sep = table_lines[data_start].replace('|', '').replace('-', '').replace(':', '').strip()
+                    if not sep:
+                        data_start = 2
+
+                def md_split(row_line):
+                    cells = [c.strip() for c in row_line.strip('|').split('|')]
+                    return [c for c in cells if c or len(cells) <= len(headers)]
+
+                _narrate_rows(headers, table_lines[data_start:], md_split)
+                continue
+            else:
+                for tl in table_lines:
+                    result.append(tl)
+                continue
+
+        # Detect tab-separated table (e.g., copied from spreadsheet)
+        elif '\t' in line and i + 1 < len(lines) and '\t' in lines[i + 1].strip():
+            table_lines = []
+            while i < len(lines):
+                l = lines[i]
+                if '\t' not in l and l.strip():
+                    break
+                if l.strip():
+                    table_lines.append(l)
+                i += 1
+
+            if len(table_lines) >= 2:
+                headers = [c.strip() for c in table_lines[0].split('\t')]
+                headers = [h for h in headers if h]
+
+                def tsv_split(row_line):
+                    return [c.strip() for c in row_line.split('\t')]
+
+                _narrate_rows(headers, table_lines[1:], tsv_split)
+                continue
+            else:
+                for tl in table_lines:
+                    result.append(tl)
+                continue
+
+        else:
+            result.append(lines[i])
+            i += 1
+
+    return '\n'.join(result)
+
+
+def clean_text_for_speech(text):
+    """Strip markdown/URL noise so TTS reads cleanly."""
+    # Strip emojis first — TTS reads their Unicode names ("white heavy check mark")
+    text = _RE_EMOJI.sub('', text)
+    # Tables — before pipe characters get stripped as noise
+    text = _format_table_for_speech(text)
+    # Images first (before links, since ![...] contains [...])
+    text = _RE_MD_IMAGE.sub(r'\1', text)
+    # Links: keep the display text
+    text = _RE_MD_LINK.sub(r'\1', text)
+    # HTML tags
+    text = _RE_HTML_TAG.sub('', text)
+    # Code fences
+    text = _RE_CODE_FENCE.sub('', text)
+    # Horizontal rules
+    text = _RE_HR.sub('', text)
+    # Headings (strip the # markers, keep the text)
+    text = _RE_HEADING.sub('', text)
+    # Blockquotes
+    text = _RE_BLOCKQUOTE.sub('', text)
+    # Bullet markers
+    text = _RE_BULLET.sub('', text)
+    # Numbered list markers
+    text = _RE_NUMBERED.sub('', text)
+    # Inline code: keep the content, drop the backticks
+    text = _RE_INLINE_CODE.sub(r'\1', text)
+    # Bold/italic markers
+    text = _RE_BOLD_ITALIC.sub('', text)
+    # URLs -> human readable
+    text = _RE_URL.sub(_humanize_url, text)
+    # Underscores between words -> spaces (e.g., my_function -> my function)
+    text = re.sub(r'(?<=\w)_(?=\w)', ' ', text)
+    # Remaining noise characters
+    text = _RE_NOISE.sub('', text)
+    # Stray hashes that aren't part of words (e.g., leftover #)
+    text = re.sub(r'(?<!\w)#(?!\w)', '', text)
+    # Clean up whitespace
+    text = _RE_MULTI_SPACE.sub(' ', text)
+    text = _RE_MULTI_NEWLINE.sub('\n\n', text)
+    return text.strip()
+
+
+async def stream_tts(text, voice, rate, pitch, volume):
+    """Stream TTS audio to the player."""
+    import edge_tts
+
+    player = subprocess.Popen(PLAYER_CMD, stdin=subprocess.PIPE)
+    try:
+        communicate = edge_tts.Communicate(
+            text, voice, rate=rate, pitch=pitch, volume=volume)
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                player.stdin.write(chunk["data"])
+                player.stdin.flush()
+        player.stdin.close()
+        player.wait()
+    except BrokenPipeError:
+        pass
+    except Exception:
+        pass
+    finally:
+        try:
+            if player.stdin and not player.stdin.closed:
+                player.stdin.close()
+        except Exception:
+            pass
+        if player.poll() is None:
+            player.kill()
+            player.wait()
+
+
+def main():
+    args = parse_args()
+
+    if args["stop"]:
+        stop_existing()
+        return
+
+    # Stop any existing speech first
+    stop_existing()
+
+    # New process group so one signal kills us + play child. Must happen
+    # BEFORE reading stdin: a process wedged in stdin.read() with no PID
+    # file registered is unstoppable from the outside.
+    try:
+        os.setpgrp()
+    except OSError:
+        pass  # already a group/session leader (spawned with start_new_session)
+
+    # Write PID file
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(PID_FILE, "w") as f:
+        f.write(str(os.getpgid(0)))
+
+    try:
+        if args["stdin"]:
+            args["text"] = sys.stdin.read()
+        if not args["text"]:
+            return
+
+        # Load settings, CLI args take priority
+        settings = load_settings()
+        voice = args["voice"] or settings["voice"]
+        rate = args["rate"] or settings["rate"]
+        pitch = args["pitch"] or settings["pitch"]
+        volume = args["volume"] or settings.get("volume", "+0%")
+
+        text = clean_text_for_speech(args["text"])
+        if not text:
+            return
+
+        import asyncio
+        try:
+            asyncio.run(stream_tts(text, voice, rate, pitch, volume))
+        except (KeyboardInterrupt, SystemExit):
+            pass
+    finally:
+        # Only remove the PID file if it still points at us — a newer
+        # speak process may have replaced it, and deleting that entry
+        # would make the new playback unstoppable.
+        try:
+            with open(PID_FILE) as f:
+                if int(f.read().strip()) == os.getpgid(0):
+                    os.unlink(PID_FILE)
+        except (OSError, ValueError):
+            pass
+
+
+if __name__ == "__main__":
+    main()

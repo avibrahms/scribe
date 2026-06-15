@@ -335,6 +335,25 @@ OPENAI_VOICES: list[tuple[str, str]] = [
     ("Fable · storyteller",       "fable"),
 ]
 
+# OpenAI models. Only gpt-4o-mini-tts honours `instructions` (emotion
+# steering); tts-1 / tts-1-hd ignore it but all three honour `speed`.
+DEFAULT_OPENAI_MODEL = OPENAI_TTS_MODEL  # "gpt-4o-mini-tts"
+OPENAI_MODELS: list[tuple[str, str]] = [
+    ("gpt-4o-mini-tts · steerable emotion", "gpt-4o-mini-tts"),
+    ("tts-1 · fast, no emotion steering",   "tts-1"),
+    ("tts-1-hd · higher fidelity",          "tts-1-hd"),
+]
+OPENAI_MODEL_IDS = {m for _, m in OPENAI_MODELS}
+
+# Playback speed multiplier accepted by the speech endpoint.
+DEFAULT_OPENAI_SPEED = 1.0
+OPENAI_SPEED_MIN, OPENAI_SPEED_MAX = 0.25, 4.0
+
+# Edge prosody (SSML-style strings edge-tts accepts verbatim).
+DEFAULT_EDGE_RATE = "+0%"
+DEFAULT_EDGE_PITCH = "+0Hz"
+DEFAULT_EDGE_VOLUME = "+0%"
+
 
 def load_tts_engine() -> str:
     cfg = load_cfg()
@@ -380,6 +399,104 @@ def save_tts_instructions(text: str) -> None:
     cfg["openai_instructions"] = text
     save_cfg(cfg)
     _write_speak_settings(openai_instructions=text)
+
+
+def load_openai_model() -> str:
+    m = str(load_cfg().get("openai_model", "")).strip()
+    return m if m in OPENAI_MODEL_IDS else DEFAULT_OPENAI_MODEL
+
+
+def save_openai_model(model: str) -> None:
+    model = model.strip()
+    if model not in OPENAI_MODEL_IDS:
+        return
+    cfg = load_cfg()
+    cfg["openai_model"] = model
+    save_cfg(cfg)
+    _write_speak_settings(openai_model=model)
+
+
+def load_openai_speed() -> float:
+    try:
+        s = float(load_cfg().get("openai_speed", DEFAULT_OPENAI_SPEED))
+    except (TypeError, ValueError):
+        return DEFAULT_OPENAI_SPEED
+    return min(OPENAI_SPEED_MAX, max(OPENAI_SPEED_MIN, s))
+
+
+def save_openai_speed(speed: float) -> None:
+    try:
+        s = min(OPENAI_SPEED_MAX, max(OPENAI_SPEED_MIN, float(speed)))
+    except (TypeError, ValueError):
+        return
+    cfg = load_cfg()
+    cfg["openai_speed"] = s
+    save_cfg(cfg)
+    _write_speak_settings(openai_speed=s)
+
+
+# ---------- Edge prosody (rate / pitch / volume) -------------------------
+
+def load_edge_rate() -> str:
+    return str(load_cfg().get("edge_rate") or DEFAULT_EDGE_RATE)
+
+
+def load_edge_pitch() -> str:
+    return str(load_cfg().get("edge_pitch") or DEFAULT_EDGE_PITCH)
+
+
+def load_edge_volume() -> str:
+    return str(load_cfg().get("edge_volume") or DEFAULT_EDGE_VOLUME)
+
+
+def save_edge_prosody(*, rate: str | None = None,
+                      pitch: str | None = None,
+                      volume: str | None = None) -> None:
+    """Persist Edge prosody to cfg, the JSON mirror (primary source for the
+    standalone helper) and the shell-sourceable config (external-hotkey parity)."""
+    cfg = load_cfg()
+    if rate is not None:
+        cfg["edge_rate"] = rate
+    if pitch is not None:
+        cfg["edge_pitch"] = pitch
+    if volume is not None:
+        cfg["edge_volume"] = volume
+    save_cfg(cfg)
+
+    mirror = {}
+    if rate is not None:
+        mirror["rate"] = rate
+    if pitch is not None:
+        mirror["pitch"] = pitch
+    if volume is not None:
+        mirror["volume"] = volume
+    if mirror:
+        _write_speak_settings(**mirror)
+    _update_shell_config(RATE=rate, PITCH=pitch, VOLUME=volume)
+
+
+def _update_shell_config(**kv) -> None:
+    """Merge KEY="value" pairs into the shell-sourceable VOICE_CONFIG_FILE,
+    preserving any keys already there."""
+    existing = {
+        "VOICE": load_voice(),
+        "RATE": DEFAULT_EDGE_RATE,
+        "PITCH": DEFAULT_EDGE_PITCH,
+        "VOLUME": DEFAULT_EDGE_VOLUME,
+    }
+    if VOICE_CONFIG_FILE.exists():
+        try:
+            existing.update(_parse_shell_kv(VOICE_CONFIG_FILE.read_text()))
+        except Exception:
+            pass
+    for k, v in kv.items():
+        if v is not None:
+            existing[k] = v
+    out = "\n".join(f'{k}="{v}"' for k, v in existing.items()) + "\n"
+    try:
+        VOICE_CONFIG_FILE.write_text(out)
+    except Exception:
+        pass
 
 
 def _write_speak_settings(**fields) -> None:

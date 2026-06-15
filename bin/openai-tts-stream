@@ -86,7 +86,7 @@ def stop_existing():
 
 def parse_args():
     args = {"stop": False, "text": None, "stdin": False,
-            "voice": None, "instructions": None, "model": None}
+            "voice": None, "instructions": None, "model": None, "speed": None}
     i = 1
     while i < len(sys.argv):
         a = sys.argv[i]
@@ -114,6 +114,11 @@ def parse_args():
             args["model"] = sys.argv[i]
         elif a.startswith("--model="):
             args["model"] = a[8:]
+        elif a == "--speed" and i + 1 < len(sys.argv):
+            i += 1
+            args["speed"] = sys.argv[i]
+        elif a.startswith("--speed="):
+            args["speed"] = a[8:]
         i += 1
     return args
 
@@ -123,6 +128,7 @@ def load_settings():
         "openai_voice": DEFAULT_VOICE,
         "openai_instructions": DEFAULT_INSTRUCTIONS,
         "openai_model": DEFAULT_MODEL,
+        "openai_speed": 1.0,
     }
     if os.path.exists(SETTINGS_FILE):
         try:
@@ -251,18 +257,23 @@ def chunk_text(text):
     return [c.strip() for c in chunks if c.strip()]
 
 
-def stream_tts(text, voice, instructions, model, api_key):
+def stream_tts(text, voice, instructions, model, speed, api_key):
     """Stream OpenAI TTS audio for each chunk into one continuous player."""
     player = subprocess.Popen(PLAYER_CMD, stdin=subprocess.PIPE)
     try:
         for chunk in chunk_text(text):
-            payload = json.dumps({
+            body = {
                 "model": model,
                 "voice": voice,
                 "input": chunk,
-                "instructions": instructions,
                 "response_format": "mp3",
-            }).encode("utf-8")
+                "speed": speed,
+            }
+            # Only gpt-4o-* models accept `instructions`; tts-1 / tts-1-hd
+            # reject it. Send it solely where it does something.
+            if instructions and model.startswith("gpt-4o"):
+                body["instructions"] = instructions
+            payload = json.dumps(body).encode("utf-8")
             req = urllib.request.Request(
                 API_URL,
                 data=payload,
@@ -345,13 +356,19 @@ def main():
         voice = args["voice"] or settings["openai_voice"]
         instructions = args["instructions"] or settings["openai_instructions"]
         model = args["model"] or settings["openai_model"]
+        try:
+            speed = float(args["speed"] if args["speed"] is not None
+                          else settings["openai_speed"])
+        except (TypeError, ValueError):
+            speed = 1.0
+        speed = min(4.0, max(0.25, speed))
 
         text = clean_text_for_speech(args["text"])
         if not text:
             return
 
         try:
-            stream_tts(text, voice, instructions, model, api_key)
+            stream_tts(text, voice, instructions, model, speed, api_key)
         except (KeyboardInterrupt, SystemExit):
             pass
     finally:
