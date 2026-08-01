@@ -4,7 +4,7 @@
 
 Hold a modifier key anywhere on your computer, speak, release → the transcript pastes into whatever text field you're looking at. Miss the text field? Press `⌃⌘V` (macOS) or `Ctrl+Alt+V` (Windows) to paste the last transcript again. Every transcript is kept in a scrollable history you can copy from.
 
-No subscription, no account, no telemetry. The only thing that leaves your computer is a ~3-second audio clip sent to Groq's free Whisper API, and an optional TTS text string sent to Microsoft Edge's free read-aloud endpoint.
+No subscription, no account, no telemetry. The only thing that leaves your computer is a ~3-second audio clip sent to Groq's free Whisper API, and an optional TTS text string sent to the read-aloud engine you pick (Microsoft Edge's free endpoint, or OpenAI).
 
 **Supported:** macOS 12+ · Windows 10+
 
@@ -18,7 +18,8 @@ Wispr Flow is great, but it's **$12/month**, proprietary, and sends your audio a
 | Auto-pastes into focused field | ✓ | ✓ |
 | Transcript history | ✓ | ✓ |
 | Multi-language dictation | ✓ | ✓ (Whisper-large-v3-turbo) |
-| TTS read-aloud | ✗ | ✓ (Microsoft Edge voices) |
+| TTS read-aloud | ✗ | ✓ (OpenAI or Microsoft Edge voices) |
+| Per-language TTS voice | ✗ | ✓ (auto-detected, offline) |
 | Clipboard preserved during paste | — | ✓ (macOS: full; Windows: text) |
 | Open source | ✗ | ✓ (MIT) |
 | Cost | $12 / month | **$0** |
@@ -31,6 +32,9 @@ Wispr Flow is great, but it's **$12/month**, proprietary, and sends your audio a
   - **Microsoft Edge** — free, unlimited Edge neural voices (Ava, Andrew, Brian, Emma, William, Sonia, Natasha, Denise, Elvira, Katja, Elsa, etc.), no API key.
 
   The engine and per-engine voice are remembered across relaunch. Keys are stored only in the gitignored `.env` and a `0600` file under `~/.config/speak-selection/` — never committed.
+- **Per-language voices**: the language of the text is detected before it is spoken, and each language uses the voice you picked for it — Henri for French, William for English, and so on, per engine. Set them under *Voice* in either engine's tuning menu: pick a voice inside a language's submenu and the ✓ stays there. Anything not mapped falls back to *Default — other languages*, and *Auto-detect language* turns the whole thing off.
+
+  Detection is offline and dependency-free (`bin/tts_lang.py`) — no text is sent anywhere to identify it. It covers the languages Scribe ships voices for (English, French, Spanish, German, Italian) and deliberately answers "unsure" rather than guessing, in which case the default voice is used. The app and the standalone ⌃D/⌃X helpers share the one detector, so both pick the same voice for the same text. macOS only for now — the Windows tray app keeps the single-voice behaviour.
 - **Hotkey observation**: a listen-only global key watcher (`CGEventTap` on macOS, `pynput` on Windows) — never intercepts or blocks keystrokes.
 - **Persistence**: auto-starts at login (`launchd` on macOS, Startup-folder shortcut on Windows).
 
@@ -40,6 +44,10 @@ Wispr Flow is great, but it's **$12/month**, proprietary, and sends your audio a
 scribe_core.py            — platform-agnostic: audio, transcription, history, voices
 scribe.py                 — macOS entry (rumps / AppKit / Quartz)
 scribe_windows.py         — Windows entry (pystray / pynput / pyperclip)
+bin/tts_lang.py           — offline language detector, shared by the app + helpers
+bin/edge-tts-stream       — standalone Edge TTS helper (⌃D / ⌃X Quick Actions)
+bin/openai-tts-stream     — standalone OpenAI TTS helper
+bin/speak-selection.sh    — routes the Quick Actions to the selected engine
 setup.py                  — macOS .app build recipe (py2app)
 install.sh                — macOS installer
 install.bat               — Windows installer
@@ -119,7 +127,8 @@ Windows has no TCC/permissions system to grant — Scribe just works. Caveats:
 - **Re-paste the last transcript**: `⌃⌘V` on macOS, `Ctrl+Alt+V` on Windows.
 - **Change hotkey**: tray menu → *Dictation Hotkey*. Options differ slightly per OS (macOS has Fn/🌐 + left/right modifiers; Windows has left/right Alt/Ctrl/Shift/Win).
 - **Change dictation language**: tray menu → *Dictation Language*.
-- **Speak text aloud**: tray menu → *Test Voice*.
+- **Speak text aloud**: tray menu → *Test Voice*, or *Read selected text* (⌃D) / *Read copied text* (⌃X).
+- **Set a voice per language**: tray menu → *OpenAI TTS — tuning* or *Microsoft Edge TTS — tuning* → *Voice* → pick a voice inside a language's submenu.
 - **Browse history**: tray menu → *History*. Click any entry to copy it.
 
 ## File locations
@@ -134,6 +143,7 @@ Windows has no TCC/permissions system to grant — Scribe just works. Caveats:
 
 - Audio: sent to `api.groq.com` for transcription. Groq's policy is on [their site](https://groq.com/privacy-policy/).
 - TTS text: sent to the selected engine — Microsoft's Edge read-aloud endpoint (free) or OpenAI's `api.openai.com` (when the OpenAI engine is selected).
+- TTS language detection runs entirely on your machine (`bin/tts_lang.py`, no dependencies, no network) — text is never sent anywhere just to identify its language.
 - Nothing else leaves your machine. No analytics, no crash reporting, no phone-home.
 - Transcript history is stored locally as plain JSON Lines — easy to grep or delete.
 

@@ -97,6 +97,16 @@ from scribe_core import (
     save_edge_prosody,
     openai_api_key,
     save_openai_key,
+    TTS_LANGS,
+    TTS_LANG_LABELS,
+    lang_of_voice,
+    load_tts_autodetect,
+    save_tts_autodetect,
+    load_edge_voice_map,
+    load_openai_voice_map,
+    save_edge_voice_for_lang,
+    save_openai_voice_for_lang,
+    resolve_tts_voice,
     transcribe,
     is_garbage,
     reset_portaudio,
@@ -705,7 +715,15 @@ class ScribeApp(rumps.App):
         self.edge_volume = load_edge_volume()
         self.hotkey_id = load_hotkey_id()
 
+        # Per-language voice picking. The menu keeps no state of its own —
+        # these registries let _refresh_voice_marks re-derive every check
+        # mark from config after any pick.
+        self.tts_autodetect = load_tts_autodetect()
+        self._voice_items: dict[str, list] = {"edge": [], "openai": []}
+        self._autodetect_items: list[rumps.MenuItem] = []
+
         self._build_menu()
+        self._refresh_autodetect_marks()
 
         # Hotkey watcher on background thread. Handles both the push-to-talk
         # modifier and the global ⌃⌘V "paste last transcript" shortcut.
@@ -748,13 +766,8 @@ class ScribeApp(rumps.App):
 
         # --- OpenAI TTS: voice + every tunable, all in one submenu --------
         self.openai_menu = rumps.MenuItem("OpenAI TTS — tuning")
-        #   Voice
-        self.openai_voice_menu = rumps.MenuItem("Voice")
-        for label, voice_id in OPENAI_VOICES:
-            item = rumps.MenuItem(label, callback=self._make_openai_voice_cb(voice_id))
-            if voice_id == self.openai_voice:
-                item.state = 1
-            self.openai_voice_menu.add(item)
+        #   Voice — one pick per language, plus the fallback default.
+        self.openai_voice_menu = self._build_voice_menu("openai")
         self.openai_menu.add(self.openai_voice_menu)
         #   Emotion / tone (the steering instructions — biggest lever)
         self.openai_menu.add(self._build_emotion_menu())
@@ -773,19 +786,8 @@ class ScribeApp(rumps.App):
 
         # --- Microsoft Edge TTS: voice + every tunable --------------------
         self.edge_menu = rumps.MenuItem("Microsoft Edge TTS — tuning")
-        #   Voice (language-grouped tree)
-        self.voice_menu = rumps.MenuItem("Voice")
-        for lang, voices in VOICES.items():
-            sub = rumps.MenuItem(lang)
-            for label, voice_id in voices:
-                item = rumps.MenuItem(
-                    label,
-                    callback=self._make_voice_cb(voice_id),
-                )
-                if voice_id == self.current_voice:
-                    item.state = 1
-                sub.add(item)
-            self.voice_menu.add(sub)
+        #   Voice — one pick per language, plus the fallback default.
+        self.voice_menu = self._build_voice_menu("edge")
         self.edge_menu.add(self.voice_menu)
         #   Speed (rate)
         self.edge_menu.add(self._build_choice_menu(
@@ -930,16 +932,133 @@ class ScribeApp(rumps.App):
 
     # -- callbacks --------------------------------------------------------
 
-    def _make_voice_cb(self, voice_id: str):
-        def cb(sender: rumps.MenuItem) -> None:
-            # Clear previous check marks in this submenu tree.
-            for sub in self.voice_menu.values():
-                for item in sub.values():
-                    item.state = 0
-            sender.state = 1
-            self.current_voice = voice_id
-            save_voice(voice_id)
-            rumps.notification("Edge voice set", voice_id, "")
+    # -- voice pickers (per detected language, per engine) ----------------
+    # Both engines share this builder so the two menus behave identically:
+    # one checkable voice per language, plus a Default group used whenever
+    # the language is unmapped or auto-detect is off/unsure.
+
+    def _voice_groups(self, engine: str) -> list[tuple[str, str, list]]:
+        """(submenu title, language code, [(label, voice_id), ...]) per group."""
+        if engine == "openai":
+            # OpenAI voices are language-neutral, so every language offers the
+            # same catalogue and the pick is purely the user's preference.
+            return [(TTS_LANG_LABELS[lang], lang, list(OPENAI_VOICES))
+                    for lang in TTS_LANGS]
+        # Edge voices are locale-bound: keep the existing English (US/UK/AU),
+        # French, … grouping and derive each group's language from its voices.
+        groups = []
+        for title, voices in VOICES.items():
+            if not voices:
+                continue
+            lang = lang_of_voice(voices[0][1])
+            if lang in TTS_LANGS:
+                groups.append((title, lang, list(voices)))
+        return groups
+
+    def _all_voices(self, engine: str) -> list[tuple[str, str]]:
+        if engine == "openai":
+            return list(OPENAI_VOICES)
+        return [v for voices in VOICES.values() for v in voices]
+
+    def _build_voice_menu(self, engine: str) -> rumps.MenuItem:
+        menu = rumps.MenuItem("Voice")
+
+        # The feature's off-switch. Unchecked, Scribe speaks everything with
+        # the Default voice below — its behaviour before auto-detect existed.
+        auto = rumps.MenuItem("Auto-detect language",
+                              callback=self._toggle_autodetect)
+        auto.state = 1 if self.tts_autodetect else 0
+        menu.add(auto)
+        self._autodetect_items.append(auto)
+        menu.add(None)
+
+        for title, lang, voices in self._voice_groups(engine):
+            sub = rumps.MenuItem(title)
+            for label, voice_id in voices:
+                item = rumps.MenuItem(
+                    label,
+                    callback=self._make_lang_voice_cb(engine, lang, voice_id),
+                )
+                sub.add(item)
+                # (language, voice, item) drives every check mark from config
+                # in _refresh_voice_marks — no state is kept in the menu.
+                self._voice_items[engine].append((lang, voice_id, item))
+            menu.add(sub)
+
+        menu.add(None)
+        default_sub = rumps.MenuItem("Default — other languages")
+        for label, voice_id in self._all_voices(engine):
+            item = rumps.MenuItem(
+                label,
+                callback=self._make_default_voice_cb(engine, voice_id),
+            )
+            default_sub.add(item)
+            self._voice_items[engine].append((None, voice_id, item))
+        menu.add(default_sub)
+
+        self._refresh_voice_marks(engine)
+        return menu
+
+    def _refresh_voice_marks(self, engine: str) -> None:
+        """Re-derive every check mark from the saved config.
+
+        Rebuilding all of them (rather than moving one) is what keeps the
+        three English Edge submenus consistent: they share the single 'en'
+        slot, so picking William in English (AU) must clear Ava in
+        English (US).
+        """
+        if engine == "openai":
+            mapping = load_openai_voice_map()
+            default = self.openai_voice
+        else:
+            mapping = load_edge_voice_map()
+            default = self.current_voice
+        for lang, voice_id, item in self._voice_items[engine]:
+            if lang is None:
+                item.state = 1 if voice_id == default else 0
+            else:
+                item.state = 1 if mapping.get(lang) == voice_id else 0
+
+    def _refresh_autodetect_marks(self) -> None:
+        for item in self._autodetect_items:
+            item.state = 1 if self.tts_autodetect else 0
+
+    def _toggle_autodetect(self, _sender: rumps.MenuItem) -> None:
+        self.tts_autodetect = not self.tts_autodetect
+        save_tts_autodetect(self.tts_autodetect)
+        self._refresh_autodetect_marks()
+        rumps.notification(
+            "TTS language auto-detect",
+            "On — each language uses its own voice" if self.tts_autodetect
+            else "Off — always the default voice",
+            "",
+        )
+
+    def _make_lang_voice_cb(self, engine: str, lang: str, voice_id: str):
+        def cb(_sender: rumps.MenuItem) -> None:
+            if engine == "openai":
+                save_openai_voice_for_lang(lang, voice_id)
+            else:
+                save_edge_voice_for_lang(lang, voice_id)
+            self._refresh_voice_marks(engine)
+            label = "OpenAI" if engine == "openai" else "Edge"
+            rumps.notification(
+                f"{label} voice — {TTS_LANG_LABELS.get(lang, lang)}",
+                voice_id, "",
+            )
+        return cb
+
+    def _make_default_voice_cb(self, engine: str, voice_id: str):
+        def cb(_sender: rumps.MenuItem) -> None:
+            if engine == "openai":
+                self.openai_voice = voice_id
+                save_openai_voice(voice_id)
+            else:
+                self.current_voice = voice_id
+                save_voice(voice_id)
+            self._refresh_voice_marks(engine)
+            label = "OpenAI" if engine == "openai" else "Edge"
+            rumps.notification(f"{label} default voice", voice_id, "")
         return cb
 
     def _make_engine_cb(self, engine_id: str):
@@ -952,16 +1071,6 @@ class ScribeApp(rumps.App):
             label = "OpenAI (natural, emotional)" if engine_id == "openai" \
                 else "Microsoft Edge (free)"
             rumps.notification("TTS engine", label, "")
-        return cb
-
-    def _make_openai_voice_cb(self, voice_id: str):
-        def cb(sender: rumps.MenuItem) -> None:
-            for item in self.openai_voice_menu.values():
-                item.state = 0
-            sender.state = 1
-            self.openai_voice = voice_id
-            save_openai_voice(voice_id)
-            rumps.notification("OpenAI voice set", voice_id, "")
         return cb
 
     # -- generic "pick a value" submenu builder ---------------------------
@@ -1402,19 +1511,26 @@ class ScribeApp(rumps.App):
             ))
             return
 
+        # Resolve the voice from the language of the text itself. Falls back
+        # to the engine's default voice when auto-detect is off, the detector
+        # is unsure, or that language has no voice mapped.
+        engine = "openai" if use_openai else "edge"
+        voice, lang = resolve_tts_voice(engine, text)
+        if lang:
+            print(f"[tts] detected {lang} → {voice}", file=sys.stderr)
+
         # Child inherits our env; for OpenAI pass the key + chosen voice so the
         # helper needs no extra lookup. Voice/instructions also live in
         # settings.json as a fallback for standalone use.
         env = os.environ.copy()
-        cmd = [str(helper), "--stdin"]
+        cmd = [str(helper), "--stdin", "--voice", voice]
         if use_openai:
             key = openai_api_key()
             if key:
                 env["OPENAI_API_KEY"] = key
-            # Voice/speed/model explicit; instructions ride along in
-            # settings.json (mirrored on every save) to keep argv small.
+            # Speed/model explicit; instructions ride along in settings.json
+            # (mirrored on every save) to keep argv small.
             cmd += [
-                "--voice", self.openai_voice,
                 "--speed", str(self.openai_speed),
                 "--model", self.openai_model,
             ]
@@ -1533,21 +1649,24 @@ class ScribeApp(rumps.App):
     def _speak_test(self) -> None:
         # For the OpenAI engine, route the sample through the normal speak
         # path so the test exercises the exact backend that Read aloud uses.
+        # The sample is English, so resolve it the same way Read aloud would:
+        # the test then previews the voice English actually speaks with, not
+        # whatever happens to be the default.
+        sample = "Notice how warm and natural this sounds."
         if self.tts_engine == "openai" and openai_api_key():
-            self._speak_text(
-                f"This is the {self.openai_voice} voice. "
-                "Notice how warm and natural this sounds."
-            )
+            voice, _ = resolve_tts_voice("openai", sample)
+            self._speak_text(f"This is the {voice} voice. {sample}")
             return
         import asyncio
         import edge_tts
         try:
+            edge_voice, _ = resolve_tts_voice("edge", sample)
             out = b""
             async def run() -> None:
                 nonlocal out
                 c = edge_tts.Communicate(
-                    f"This is {self.current_voice.split('-')[-1].replace('Neural','')}. Hello.",
-                    self.current_voice,
+                    f"This is {edge_voice.split('-')[-1].replace('Neural','')}. Hello.",
+                    edge_voice,
                     rate=self.edge_rate,
                     pitch=self.edge_pitch,
                     volume=self.edge_volume,

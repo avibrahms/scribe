@@ -475,6 +475,134 @@ def save_edge_prosody(*, rate: str | None = None,
     _update_shell_config(RATE=rate, PITCH=pitch, VOLUME=volume)
 
 
+# ---------- per-language TTS voices --------------------------------------
+# The language of the text being spoken is detected at speak time and used to
+# look up a voice chosen for that language, per engine. Anything not mapped
+# (or not confidently detected) falls back to the single default voice, which
+# is exactly how Scribe behaved before this existed.
+
+def _load_tts_lang():
+    """Import the shared detector from bin/, or ~/bin where it is deployed.
+
+    Loaded by path rather than as a package because the same file is imported
+    by the two standalone helpers as a plain sibling module — one detector,
+    three consumers, no duplicated word tables.
+    """
+    import importlib.util
+    for cand in (APP_DIR / "bin" / "tts_lang.py", Path.home() / "bin" / "tts_lang.py"):
+        try:
+            if not cand.exists():
+                continue
+            spec = importlib.util.spec_from_file_location("tts_lang", cand)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+        except Exception as exc:
+            print(f"[tts_lang] load failed from {cand}: {exc}", file=sys.stderr)
+    return None
+
+
+tts_lang = _load_tts_lang()
+
+# Languages offered in the menus. Sourced from the detector so the two can
+# never disagree about what "supported" means; empty if it failed to load,
+# which degrades to the old single-voice behaviour instead of crashing.
+TTS_LANGS: tuple[str, ...] = tuple(tts_lang.SUPPORTED_LANGS) if tts_lang else ()
+TTS_LANG_LABELS: dict[str, str] = dict(tts_lang.LANG_LABELS) if tts_lang else {}
+
+DEFAULT_TTS_AUTODETECT = True
+
+
+def detect_tts_language(text: str) -> str | None:
+    """Language code for `text`, or None when the detector is unsure/absent."""
+    if not tts_lang:
+        return None
+    try:
+        return tts_lang.detect_language(text)
+    except Exception as exc:
+        print(f"[tts_lang] detect failed: {exc}", file=sys.stderr)
+        return None
+
+
+def lang_of_voice(voice_id: str) -> str:
+    """Language code an Edge voice belongs to ('fr-FR-HenriNeural' -> 'fr').
+
+    Derived from the id instead of a hand-kept table, so the three English
+    submenus (US/UK/AU) all correctly resolve to one 'en' slot.
+    """
+    return (voice_id or "").split("-")[0].lower()
+
+
+def load_tts_autodetect() -> bool:
+    val = load_cfg().get("tts_autodetect", DEFAULT_TTS_AUTODETECT)
+    return bool(val)
+
+
+def save_tts_autodetect(enabled: bool) -> None:
+    cfg = load_cfg()
+    cfg["tts_autodetect"] = bool(enabled)
+    save_cfg(cfg)
+    _write_speak_settings(tts_autodetect=bool(enabled))
+
+
+def _load_voice_map(key: str) -> dict[str, str]:
+    raw = load_cfg().get(key)
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        str(k): str(v) for k, v in raw.items()
+        if k in TTS_LANGS and isinstance(v, str) and v.strip()
+    }
+
+
+def load_edge_voice_map() -> dict[str, str]:
+    return _load_voice_map("edge_voice_by_lang")
+
+
+def load_openai_voice_map() -> dict[str, str]:
+    return _load_voice_map("openai_voice_by_lang")
+
+
+def _save_voice_for_lang(key: str, lang: str, voice: str) -> dict[str, str]:
+    if lang not in TTS_LANGS or not voice:
+        return _load_voice_map(key)
+    cfg = load_cfg()
+    current = cfg.get(key)
+    mapping = dict(current) if isinstance(current, dict) else {}
+    mapping[lang] = voice
+    cfg[key] = mapping
+    save_cfg(cfg)
+    # Mirror for the standalone helpers, which read settings.json only.
+    _write_speak_settings(**{key: mapping})
+    return mapping
+
+
+def save_edge_voice_for_lang(lang: str, voice: str) -> dict[str, str]:
+    return _save_voice_for_lang("edge_voice_by_lang", lang, voice)
+
+
+def save_openai_voice_for_lang(lang: str, voice: str) -> dict[str, str]:
+    return _save_voice_for_lang("openai_voice_by_lang", lang, voice)
+
+
+def resolve_tts_voice(engine: str, text: str) -> tuple[str, str | None]:
+    """(voice, detected_lang) for speaking `text` with `engine`.
+
+    The single place the fallback chain lives: auto-detect off, detector
+    unsure, or language unmapped all end at the engine's default voice.
+    """
+    default = load_openai_voice() if engine == "openai" else load_voice()
+    if not load_tts_autodetect():
+        return default, None
+    lang = detect_tts_language(text)
+    if not lang:
+        return default, None
+    mapping = load_openai_voice_map() if engine == "openai" else load_edge_voice_map()
+    if tts_lang:
+        return tts_lang.voice_for_lang(mapping, lang, default), lang
+    return mapping.get(lang) or default, lang
+
+
 def _update_shell_config(**kv) -> None:
     """Merge KEY="value" pairs into the shell-sourceable VOICE_CONFIG_FILE,
     preserving any keys already there."""

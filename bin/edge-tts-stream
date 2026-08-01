@@ -93,10 +93,39 @@ def parse_args():
     return args
 
 
+# Shared language detector, deployed next to this script. Optional on
+# purpose: if it is missing we simply speak with the configured voice, which
+# is what this helper did before per-language voices existed.
+try:
+    import tts_lang
+except Exception:
+    tts_lang = None
+
+
+def auto_voice(text, settings, explicit):
+    """Voice to speak `text` with: an explicit --voice always wins.
+
+    Mirrors scribe_core.resolve_tts_voice so the ⌃D Quick Action and the app
+    menu pick the same voice for the same text.
+    """
+    if explicit:
+        return explicit
+    default = settings["voice"]
+    if tts_lang is None or not settings.get("tts_autodetect", True):
+        return default
+    try:
+        lang = tts_lang.detect_language(text)
+        return tts_lang.voice_for_lang(
+            settings.get("edge_voice_by_lang"), lang, default)
+    except Exception:
+        return default
+
+
 def load_settings():
     """Load voice/rate/pitch/volume from config."""
     settings = {"voice": "en-US-BrianNeural", "rate": "+0%",
-                "pitch": "+0Hz", "volume": "+0%"}
+                "pitch": "+0Hz", "volume": "+0%",
+                "edge_voice_by_lang": {}, "tts_autodetect": True}
     if os.path.exists(SETTINGS_FILE):
         try:
             with open(SETTINGS_FILE) as f:
@@ -414,7 +443,7 @@ def main():
 
         # Load settings, CLI args take priority
         settings = load_settings()
-        voice = args["voice"] or settings["voice"]
+        voice = auto_voice(args["text"], settings, args["voice"])
         rate = args["rate"] or settings["rate"]
         pitch = args["pitch"] or settings["pitch"]
         volume = args["volume"] or settings.get("volume", "+0%")

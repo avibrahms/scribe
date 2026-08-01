@@ -123,12 +123,42 @@ def parse_args():
     return args
 
 
+# Shared language detector, deployed next to this script. Optional on
+# purpose: if it is missing we simply speak with the configured voice, which
+# is what this helper did before per-language voices existed.
+try:
+    import tts_lang
+except Exception:
+    tts_lang = None
+
+
+def auto_voice(text, settings, explicit):
+    """Voice to speak `text` with: an explicit --voice always wins.
+
+    Mirrors scribe_core.resolve_tts_voice so the ⌃D Quick Action and the app
+    menu pick the same voice for the same text.
+    """
+    if explicit:
+        return explicit
+    default = settings["openai_voice"]
+    if tts_lang is None or not settings.get("tts_autodetect", True):
+        return default
+    try:
+        lang = tts_lang.detect_language(text)
+        return tts_lang.voice_for_lang(
+            settings.get("openai_voice_by_lang"), lang, default)
+    except Exception:
+        return default
+
+
 def load_settings():
     settings = {
         "openai_voice": DEFAULT_VOICE,
         "openai_instructions": DEFAULT_INSTRUCTIONS,
         "openai_model": DEFAULT_MODEL,
         "openai_speed": 1.0,
+        "openai_voice_by_lang": {},
+        "tts_autodetect": True,
     }
     if os.path.exists(SETTINGS_FILE):
         try:
@@ -137,6 +167,10 @@ def load_settings():
             for k in settings:
                 if data.get(k):
                     settings[k] = data[k]
+            # Read separately: the truthiness test above would silently drop
+            # a stored `false`, leaving auto-detect stuck on.
+            if isinstance(data.get("tts_autodetect"), bool):
+                settings["tts_autodetect"] = data["tts_autodetect"]
         except Exception:
             pass
     return settings
@@ -353,7 +387,7 @@ def main():
             return
 
         settings = load_settings()
-        voice = args["voice"] or settings["openai_voice"]
+        voice = auto_voice(args["text"], settings, args["voice"])
         instructions = args["instructions"] or settings["openai_instructions"]
         model = args["model"] or settings["openai_model"]
         try:
