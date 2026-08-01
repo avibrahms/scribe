@@ -146,7 +146,8 @@ def auto_voice(text, settings, explicit):
     try:
         lang = tts_lang.detect_language(text)
         return tts_lang.voice_for_lang(
-            settings.get("openai_voice_by_lang"), lang, default)
+            settings.get("openai_voice_by_lang"), lang, default,
+            settings.get("openai_lang_defaults"))
     except Exception:
         return default
 
@@ -158,6 +159,7 @@ def load_settings():
         "openai_model": DEFAULT_MODEL,
         "openai_speed": 1.0,
         "openai_voice_by_lang": {},
+        "openai_lang_defaults": {},
         "tts_autodetect": True,
     }
     if os.path.exists(SETTINGS_FILE):

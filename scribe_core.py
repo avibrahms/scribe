@@ -603,14 +603,25 @@ def edge_lang_defaults() -> dict[str, str]:
     return out
 
 
-def lang_defaults_for(engine: str) -> dict[str, str]:
-    """Per-language default voices, or {} for engines that do not need them.
+def openai_lang_defaults() -> dict[str, str]:
+    """{language: a distinct OpenAI voice}, dealt from OPENAI_VOICES in order.
 
-    OpenAI's voices are language-neutral — every one of them speaks every
-    supported language — so there is no per-language default to pick and the
-    configured default voice is already the right answer.
+    Unlike Edge, OpenAI's voices carry no locale — every one of them speaks
+    every supported language — so there is no linguistically correct mapping
+    to derive. What matters is that each language starts with its own stable,
+    distinct, overridable default the menu can show. Dealing from the
+    catalogue in order keeps even that derived: a language added to
+    TTS_LANGS picks up the next voice with no table to update.
     """
-    return {} if engine == "openai" else edge_lang_defaults()
+    voices = [voice_id for _label, voice_id in OPENAI_VOICES]
+    if not voices:
+        return {}
+    return {lang: voices[i % len(voices)] for i, lang in enumerate(TTS_LANGS)}
+
+
+def lang_defaults_for(engine: str) -> dict[str, str]:
+    """Per-language default voices for the engine."""
+    return openai_lang_defaults() if engine == "openai" else edge_lang_defaults()
 
 
 def effective_tts_voice(engine: str, lang: str | None) -> str:
@@ -703,10 +714,11 @@ def _write_speak_settings(**fields) -> None:
     settings.setdefault("openai_voice", DEFAULT_OPENAI_VOICE)
     settings.setdefault("openai_instructions", DEFAULT_TTS_INSTRUCTIONS)
     settings.setdefault("openai_model", OPENAI_TTS_MODEL)
-    # Always refreshed rather than defaulted: it is derived from the voice
-    # catalogue, so it must follow VOICES rather than whatever was written
-    # to disk by an older build.
+    # Always refreshed rather than defaulted: both are derived from the voice
+    # catalogues, so they must follow VOICES / OPENAI_VOICES rather than
+    # whatever was written to disk by an older build.
     settings["edge_lang_defaults"] = edge_lang_defaults()
+    settings["openai_lang_defaults"] = openai_lang_defaults()
     for k, v in fields.items():
         if v is not None:
             settings[k] = v
