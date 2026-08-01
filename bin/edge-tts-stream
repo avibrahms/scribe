@@ -116,7 +116,8 @@ def auto_voice(text, settings, explicit):
     try:
         lang = tts_lang.detect_language(text)
         return tts_lang.voice_for_lang(
-            settings.get("edge_voice_by_lang"), lang, default)
+            settings.get("edge_voice_by_lang"), lang, default,
+            settings.get("edge_lang_defaults"))
     except Exception:
         return default
 
@@ -125,7 +126,8 @@ def load_settings():
     """Load voice/rate/pitch/volume from config."""
     settings = {"voice": "en-US-BrianNeural", "rate": "+0%",
                 "pitch": "+0Hz", "volume": "+0%",
-                "edge_voice_by_lang": {}, "tts_autodetect": True}
+                "edge_voice_by_lang": {}, "edge_lang_defaults": {},
+                "tts_autodetect": True}
     if os.path.exists(SETTINGS_FILE):
         try:
             with open(SETTINGS_FILE) as f:

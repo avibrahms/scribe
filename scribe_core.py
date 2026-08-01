@@ -585,22 +585,85 @@ def save_openai_voice_for_lang(lang: str, voice: str) -> dict[str, str]:
     return _save_voice_for_lang("openai_voice_by_lang", lang, voice)
 
 
+def edge_lang_defaults() -> dict[str, str]:
+    """{language: first Edge voice of that language}, derived from VOICES.
+
+    The catalogue is the only place this is declared, so adding a language to
+    VOICES gives it a sensible default automatically. Edge voices are
+    locale-bound, so a language the user has not picked a voice for must still
+    fall back to a voice that actually speaks it — not to whatever the global
+    default happens to be.
+    """
+    out: dict[str, str] = {}
+    for voices in VOICES.values():
+        for _label, voice_id in voices:
+            lang = lang_of_voice(voice_id)
+            if lang in TTS_LANGS:
+                out.setdefault(lang, voice_id)
+    return out
+
+
+def lang_defaults_for(engine: str) -> dict[str, str]:
+    """Per-language default voices, or {} for engines that do not need them.
+
+    OpenAI's voices are language-neutral — every one of them speaks every
+    supported language — so there is no per-language default to pick and the
+    configured default voice is already the right answer.
+    """
+    return {} if engine == "openai" else edge_lang_defaults()
+
+
+def effective_tts_voice(engine: str, lang: str | None) -> str:
+    """Voice that `lang` will actually be spoken with, given current config.
+
+    Shared by the resolver and the menu so a check mark can never disagree
+    with what is about to come out of the speakers.
+    """
+    default = load_openai_voice() if engine == "openai" else load_voice()
+    mapping = load_openai_voice_map() if engine == "openai" else load_edge_voice_map()
+    if tts_lang:
+        return tts_lang.voice_for_lang(mapping, lang, default, lang_defaults_for(engine))
+    if not lang:
+        return default
+    return mapping.get(lang) or lang_defaults_for(engine).get(lang) or default
+
+
+def sync_speak_settings() -> None:
+    """Push the app's whole TTS state into the settings.json mirror.
+
+    The app reads config.json; the standalone ⌃D/⌃X helpers read only
+    settings.json. Any config written without going through a save_* helper —
+    or any config predating a newly added key — leaves the hotkey resolving a
+    different voice than the menu displays. Called at startup so the two
+    stores cannot silently drift apart.
+    """
+    _write_speak_settings(
+        engine=load_tts_engine(),
+        voice=load_voice(),
+        rate=load_edge_rate(),
+        pitch=load_edge_pitch(),
+        volume=load_edge_volume(),
+        openai_voice=load_openai_voice(),
+        openai_instructions=load_tts_instructions(),
+        openai_model=load_openai_model(),
+        openai_speed=load_openai_speed(),
+        tts_autodetect=load_tts_autodetect(),
+        edge_voice_by_lang=load_edge_voice_map(),
+        openai_voice_by_lang=load_openai_voice_map(),
+    )
+
+
 def resolve_tts_voice(engine: str, text: str) -> tuple[str, str | None]:
     """(voice, detected_lang) for speaking `text` with `engine`.
 
-    The single place the fallback chain lives: auto-detect off, detector
-    unsure, or language unmapped all end at the engine's default voice.
+    The single place the fallback chain lives: auto-detect off or a detector
+    that is unsure end at the configured default; a detected language resolves
+    through the user's pick, then the language's own default voice.
     """
-    default = load_openai_voice() if engine == "openai" else load_voice()
     if not load_tts_autodetect():
-        return default, None
+        return effective_tts_voice(engine, None), None
     lang = detect_tts_language(text)
-    if not lang:
-        return default, None
-    mapping = load_openai_voice_map() if engine == "openai" else load_edge_voice_map()
-    if tts_lang:
-        return tts_lang.voice_for_lang(mapping, lang, default), lang
-    return mapping.get(lang) or default, lang
+    return effective_tts_voice(engine, lang), lang
 
 
 def _update_shell_config(**kv) -> None:
@@ -640,6 +703,10 @@ def _write_speak_settings(**fields) -> None:
     settings.setdefault("openai_voice", DEFAULT_OPENAI_VOICE)
     settings.setdefault("openai_instructions", DEFAULT_TTS_INSTRUCTIONS)
     settings.setdefault("openai_model", OPENAI_TTS_MODEL)
+    # Always refreshed rather than defaulted: it is derived from the voice
+    # catalogue, so it must follow VOICES rather than whatever was written
+    # to disk by an older build.
+    settings["edge_lang_defaults"] = edge_lang_defaults()
     for k, v in fields.items():
         if v is not None:
             settings[k] = v

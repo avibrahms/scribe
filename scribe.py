@@ -107,6 +107,8 @@ from scribe_core import (
     save_edge_voice_for_lang,
     save_openai_voice_for_lang,
     resolve_tts_voice,
+    effective_tts_voice,
+    sync_speak_settings,
     transcribe,
     is_garbage,
     reset_portaudio,
@@ -722,6 +724,10 @@ class ScribeApp(rumps.App):
         self._voice_items: dict[str, list] = {"edge": [], "openai": []}
         self._autodetect_items: list[rumps.MenuItem] = []
 
+        # Reconcile the helpers' settings.json with our config before the
+        # first ⌃D can fire, so hotkey and menu always agree.
+        sync_speak_settings()
+
         self._build_menu()
         self._refresh_autodetect_marks()
 
@@ -986,7 +992,7 @@ class ScribeApp(rumps.App):
             menu.add(sub)
 
         menu.add(None)
-        default_sub = rumps.MenuItem("Default — other languages")
+        default_sub = rumps.MenuItem("Default — when language is unclear")
         for label, voice_id in self._all_voices(engine):
             item = rumps.MenuItem(
                 label,
@@ -1002,22 +1008,21 @@ class ScribeApp(rumps.App):
     def _refresh_voice_marks(self, engine: str) -> None:
         """Re-derive every check mark from the saved config.
 
+        Marks the voice each language will *actually* be spoken with, not
+        merely the one explicitly picked — so a language left alone still
+        shows its default rather than looking unset.
+
         Rebuilding all of them (rather than moving one) is what keeps the
         three English Edge submenus consistent: they share the single 'en'
         slot, so picking William in English (AU) must clear Ava in
         English (US).
         """
-        if engine == "openai":
-            mapping = load_openai_voice_map()
-            default = self.openai_voice
-        else:
-            mapping = load_edge_voice_map()
-            default = self.current_voice
+        default = self.openai_voice if engine == "openai" else self.current_voice
         for lang, voice_id, item in self._voice_items[engine]:
             if lang is None:
                 item.state = 1 if voice_id == default else 0
             else:
-                item.state = 1 if mapping.get(lang) == voice_id else 0
+                item.state = 1 if effective_tts_voice(engine, lang) == voice_id else 0
 
     def _refresh_autodetect_marks(self) -> None:
         for item in self._autodetect_items:

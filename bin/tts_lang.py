@@ -303,13 +303,25 @@ def detect_language(text):
     return best_lang
 
 
-def voice_for_lang(mapping, lang, default):
-    """Pick the per-language voice, falling back to the configured default.
+def voice_for_lang(mapping, lang, default, lang_defaults=None):
+    """Pick the voice for `lang`, in order of decreasing specificity:
 
-    Shared by the app and both helpers so the fallback rule cannot drift:
-    an unmapped language, an unknown language, and an undetected language all
-    behave identically.
+      1. what the user explicitly chose for this language
+      2. the catalogue's own voice for this language (`lang_defaults`)
+      3. the configured default voice
+
+    Step 2 exists because step 3 alone gives the wrong result whenever the
+    default belongs to some other language: Spanish text has no business being
+    read by a French voice just because French is the default. Engines whose
+    voices are language-neutral (OpenAI) pass no lang_defaults and go straight
+    from 1 to 3.
+
+    Shared by the app and both helpers so the rule cannot drift.
     """
-    if not lang or not isinstance(mapping, dict):
+    if not lang:
         return default
-    return (mapping.get(lang) or default)
+    if isinstance(mapping, dict) and mapping.get(lang):
+        return mapping[lang]
+    if isinstance(lang_defaults, dict) and lang_defaults.get(lang):
+        return lang_defaults[lang]
+    return default
