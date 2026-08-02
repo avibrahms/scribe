@@ -778,6 +778,8 @@ def save_openai_key(key: str) -> None:
 
 # ---------- audio recorder ------------------------------------------------
 
+import collections  # noqa: E402  (grouped with Recorder which needs it)
+import queue      # noqa: E402  (grouped with Recorder which needs it)
 import threading  # noqa: E402  (grouped with Recorder which needs it)
 
 
@@ -789,6 +791,23 @@ import threading  # noqa: E402  (grouped with Recorder which needs it)
 # released — killing the process IS the release).
 _AUDIO_CHILD_SCRIPT = r"""
 import os, sys, threading
+
+# PortAudio's CoreAudio backend writes warnings straight to fd 1 with C-level
+# printf ("||PaMacCore (AUHAL)|| Warning on line 521..."), bypassing
+# sys.stdout entirely. Sharing fd 1 with the parent protocol means such a
+# warning gets read as a command response: the parent sees something that is
+# not "ok", SIGKILLs a perfectly healthy child and retries — and if the fresh
+# child warns too, the recording never starts at all.
+#
+# So the protocol gets a private duplicate of fd 1, and fd 1 itself is pointed
+# at stderr where library chatter is harmless. Done before importing
+# sounddevice, so PortAudio never sees the original descriptor.
+try:
+    _PROTO = os.fdopen(os.dup(1), "w", buffering=1)
+    os.dup2(2, 1)
+except Exception:
+    _PROTO = sys.stdout
+
 import sounddevice as sd
 
 SR = int(sys.argv[1])
@@ -854,9 +873,12 @@ def _do_stop():
         _stop_locked()
         return "ok"
 
+def _reply(msg):
+    _PROTO.write(msg + "\n")
+    _PROTO.flush()
+
 def _main():
-    sys.stdout.write("ready\n")
-    sys.stdout.flush()
+    _reply("ready")
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -870,13 +892,11 @@ def _main():
             resp = _do_stop()
         elif cmd == "quit":
             _do_stop()
-            sys.stdout.write("ok\n")
-            sys.stdout.flush()
+            _reply("ok")
             break
         else:
             resp = "err unknown"
-        sys.stdout.write(resp + "\n")
-        sys.stdout.flush()
+        _reply(resp)
 
 _main()
 """
@@ -913,8 +933,23 @@ class _RecordService:
     CMD_TIMEOUT = 2.0     # seconds: how long to wait for a "ok"/"err"
     KILL_WAIT = 2.0       # seconds: how long to wait for SIGKILL to reap
 
+    # Opening the input stream is the one command that is legitimately slow:
+    # a cold or contended CoreAudio device routinely needs longer than
+    # CMD_TIMEOUT, and treating that as "the service is sick" used to kill a
+    # perfectly healthy child mid-open. The retry then paid the same cold
+    # cost, blew the caller's watchdog budget and returned failure — which is
+    # what made the mic indicator appear late, or not at all until the hotkey
+    # was pressed a second time. Stop keeps the short timeout on purpose: a
+    # hung stop must be SIGKILLed quickly or the mic is never released.
+    START_TIMEOUT = 4.0
+
+    # Lines the protocol recognises. Anything else on the channel is library
+    # chatter and must be skipped rather than mistaken for a response.
+    _TOKENS = ("ok", "ready")
+
     def __init__(self) -> None:
         self._proc: subprocess.Popen | None = None
+        self._lines: "queue.Queue[str | None]" = queue.Queue()
         self._lock = threading.Lock()
 
     # -- lifecycle ----------------------------------------------------
@@ -928,37 +963,79 @@ class _RecordService:
             stderr=subprocess.PIPE,
             bufsize=0,
         )
-        line = self._readline(proc, timeout=5.0)
+        # One reader for the child's whole life, feeding a queue. A
+        # thread-per-read would strand itself inside readline() whenever a
+        # command timed out, and that stranded thread would later swallow a
+        # response meant for the next command.
+        self._lines = queue.Queue()
+        threading.Thread(target=self._pump, args=(proc, self._lines),
+                         daemon=True).start()
+        # The child's stderr now carries PortAudio's chatter as well as its
+        # own. Nobody reading it would let a noisy driver fill the pipe
+        # buffer and block the child mid-callback, so drain it continuously
+        # and keep the tail for diagnostics.
+        self._errtail = collections.deque(maxlen=20)
+        threading.Thread(target=self._pump_stderr, args=(proc, self._errtail),
+                         daemon=True).start()
+        line = self._await(timeout=5.0)
         if line != "ready":
-            err = b""
-            try:
-                if proc.stderr is not None:
-                    err = proc.stderr.read(2048) or b""
-            except Exception:
-                pass
             try: proc.kill()
             except Exception: pass
             raise RuntimeError(
                 f"audio service did not start (got {line!r}); "
-                f"stderr: {err.decode(errors='replace')[:200]}"
+                f"stderr: {' | '.join(self._errtail)[:200]}"
             )
         self._proc = proc
 
-    def _readline(self, proc: subprocess.Popen, timeout: float):
-        """Read one line from proc.stdout with a hard timeout. None on timeout."""
-        result: list[str | None] = [None]
-        done = threading.Event()
-        def _r() -> None:
+    @staticmethod
+    def _pump(proc: subprocess.Popen, q: "queue.Queue[str | None]") -> None:
+        """Drain the child's protocol channel into `q` until it exits."""
+        try:
+            out = proc.stdout
+            if out is not None:
+                for raw in iter(out.readline, b""):
+                    q.put(raw.decode(errors="replace").strip())
+        except Exception:
+            pass
+        finally:
+            q.put(None)   # EOF sentinel: the child is gone
+
+    @staticmethod
+    def _pump_stderr(proc: subprocess.Popen, tail) -> None:
+        """Keep the child's stderr flowing so it can never block on a full pipe."""
+        try:
+            err = proc.stderr
+            if err is not None:
+                for raw in iter(err.readline, b""):
+                    msg = raw.decode(errors="replace").rstrip()
+                    if msg:
+                        tail.append(msg)
+                        print(f"[rec child] {msg}", file=sys.stderr)
+        except Exception:
+            pass
+
+    def _await(self, timeout: float):
+        """Next protocol response, skipping noise. None on timeout or EOF.
+
+        Skipping rather than failing is what stops a stray line — a PortAudio
+        warning that beat the child's fd redirect, a Python warning — from
+        costing a healthy child a SIGKILL and the user a lost recording.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
             try:
-                line = proc.stdout.readline() if proc.stdout else b""
-                result[0] = line.decode(errors="replace").strip() if line else None
-            except Exception:
-                result[0] = None
-            finally:
-                done.set()
-        threading.Thread(target=_r, daemon=True).start()
-        done.wait(timeout)
-        return result[0]
+                line = self._lines.get(timeout=remaining)
+            except queue.Empty:
+                return None
+            if line is None:
+                return None
+            if line in self._TOKENS or line.startswith("err"):
+                return line
+            print(f"[rec svc] ignoring stray output: {line[:120]!r}",
+                  file=sys.stderr)
 
     def _send(self, cmd: str, timeout: float):
         if self._proc is None or self._proc.poll() is not None:
@@ -970,7 +1047,7 @@ class _RecordService:
         except Exception as exc:
             print(f"[rec svc] write failed: {exc}", file=sys.stderr)
             return None
-        return self._readline(self._proc, timeout)
+        return self._await(timeout)
 
     def _kill(self) -> None:
         """SIGKILL the child. Cannot fail. Releases the mic at the kernel."""
@@ -991,14 +1068,26 @@ class _RecordService:
     def start(self, path: str) -> bool:
         """Begin capture to `path` (raw 16-bit mono PCM). Returns True on success."""
         with self._lock:
-            resp = self._send(f"start {path}", timeout=self.CMD_TIMEOUT)
+            resp = self._send(f"start {path}", timeout=self.START_TIMEOUT)
             if resp == "ok":
                 return True
-            # Service is sick — kill and retry once with a fresh child.
-            print(f"[rec svc] start got {resp!r}; respawning", file=sys.stderr)
+
+            # The child must not be left holding the device: it may still be
+            # inside Pa_OpenStream and would go on recording into a file the
+            # caller is about to delete, with the orange mic indicator stuck
+            # on. SIGKILL is the only thing guaranteed to free it.
+            alive = self._proc is not None and self._proc.poll() is None
+            print(f"[rec svc] start got {resp!r}; killing child", file=sys.stderr)
             self._kill()
+
+            # Retry only when the failure was cheap. A timeout means we have
+            # already spent the caller's budget, and a second open would be
+            # just as slow — better to fail now and let the next hotkey press
+            # meet a warm device than to stack another wait on top.
+            if resp is None and alive:
+                return False
             try:
-                resp = self._send(f"start {path}", timeout=self.CMD_TIMEOUT)
+                resp = self._send(f"start {path}", timeout=self.START_TIMEOUT)
             except Exception as exc:
                 print(f"[rec svc] respawn start failed: {exc}", file=sys.stderr)
                 return False

@@ -1740,7 +1740,11 @@ class ScribeApp(rumps.App):
            finish eventually in the background. Without this reset, the
            user has to relaunch the whole app.
         """
-        OPEN_TIMEOUT = 5.0
+        # Must exceed the record service's own start budget
+        # (START_TIMEOUT + a SIGKILL reap), or this watchdog aborts a start
+        # that the service was about to complete — the caller sees "mic
+        # stuck" for what was only a cold CoreAudio open.
+        OPEN_TIMEOUT = 8.0
 
         # Defense 1: recover from a previous orphaned close.
         if self._pa_needs_reset:
