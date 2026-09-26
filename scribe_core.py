@@ -154,7 +154,7 @@ def append_history(text: str, duration_ms: int) -> None:
         "text": text,
         "duration_ms": duration_ms,
     }
-    with HISTORY_FILE.open("a") as f:
+    with HISTORY_FILE.open("a", encoding="utf-8") as f:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
@@ -162,7 +162,7 @@ def load_history(limit: int = 50) -> list[dict]:
     if not HISTORY_FILE.exists():
         return []
     rows: list[dict] = []
-    with HISTORY_FILE.open("r") as f:
+    with HISTORY_FILE.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -790,7 +790,7 @@ import threading  # noqa: E402  (grouped with Recorder which needs it)
 # microphone (the "orange mic icon" stays on until the audio unit is
 # released — killing the process IS the release).
 _AUDIO_CHILD_SCRIPT = r"""
-import os, sys, threading
+import os, sys, threading, time
 
 # PortAudio's CoreAudio backend writes warnings straight to fd 1 with C-level
 # printf ("||PaMacCore (AUHAL)|| Warning on line 521..."), bypassing
@@ -808,65 +808,238 @@ try:
 except Exception:
     _PROTO = sys.stdout
 
+import collections
 import sounddevice as sd
 
 SR = int(sys.argv[1])
+# Frames per callback. Left at 0, PortAudio's CoreAudio backend picks ~15
+# frames here, i.e. it runs this Python callback about 1060 times a second
+# on the real-time audio thread. At 512 frames that drops to ~31/s for the
+# same audio — 34x less interpreter work on the one thread that must never
+# fall behind.
+#
+# PortAudio only hands over whole blocks, so a bigger block also means more
+# of the tail can be left undelivered when the key is released: on average
+# half a block, 16ms here. Inaudible, and there is always some trailing
+# silence before a hand comes off the key. 512 keeps that margin while still
+# removing the pathological callback rate.
+BLOCKSIZE = int(sys.argv[2]) if len(sys.argv) > 2 else 512
 
 _stream = None
-_file = None
-# Strong refs to stopped streams — prevents Python GC from calling
-# __del__ → Pa_CloseStream, which hangs on macOS. We deliberately never
-# close streams; the process exits and the kernel reclaims everything.
+# Strong refs to streams whose close is still in flight (or wedged), so
+# Python's GC can't run __del__ → Pa_CloseStream underneath us.
 _leaked = []
 _lock = threading.Lock()
 
-def _cb(indata, frames, t, status):
-    f = _file
-    if f is not None:
+# Roughly ten minutes of audio. A bound, not a target: the writer keeps the
+# deque near-empty in practice, and it only stops the queue growing without
+# limit if the disk stops accepting writes entirely.
+_MAX_QUEUED = (SR * 600) // BLOCKSIZE
+
+
+# One recording's buffer, writer thread and output file.
+#
+# Per-recording rather than module-wide on purpose. The callback runs on
+# CoreAudio's real-time thread and used to write straight to the file from
+# there — a write() syscall on the RT thread, which on a machine that is
+# paging parks the thread for as long as the disk takes, with no slack for
+# PortAudio to absorb it. So a writer thread does the disk I/O instead.
+# That writer is joined with a timeout at stop, and a writer still stuck in
+# a slow write when the timeout expires would, if it shared one buffer with
+# the next recording, drain the NEXT clip's audio into the PREVIOUS clip's
+# file. Giving each capture its own state makes that impossible: a straggler
+# can only ever finish writing its own.
+class _Capture(object):
+    def __init__(self, f):
+        self.file = f
+        self.chunks = collections.deque()
+        self.event = threading.Event()
+        # Set by the first callback: proof the device is really delivering
+        # audio, as opposed to merely having accepted Pa_StartStream.
+        self.live = threading.Event()
+        self.capturing = True
+        self.thread = None
+
+    def drain(self):
+        while self.chunks:
+            try:
+                chunk = self.chunks.popleft()
+            except IndexError:
+                break
+            try:
+                self.file.write(chunk)
+            except Exception:
+                pass
+
+    def run(self):
+        while self.capturing:
+            self.event.wait(0.2)
+            self.event.clear()
+            self.drain()
+            # Push it to the OS every pass. The parent SIGKILLs this process
+            # when a stop wedges, and anything still in Python's file buffer
+            # (up to a quarter second of speech) would die with it.
+            try:
+                self.file.flush()
+            except Exception:
+                pass
+
+    # Stop accepting audio, flush everything captured so far, close the file.
+    def finish(self):
+        self.capturing = False
+        self.event.set()
+        if self.thread is not None:
+            self.thread.join(timeout=1.0)
+            self.thread = None
         try:
-            f.write(bytes(indata))
+            self.drain()       # whatever the writer hadn't picked up yet
+            self.file.flush()
+            self.file.close()
         except Exception:
             pass
 
+
+_cap = None   # the in-flight _Capture, or None
+
+def _cb(indata, frames, t, status):
+    # Real-time thread. Append and return — nothing blocking, ever.
+    c = _cap
+    if c is not None and c.capturing and len(c.chunks) < _MAX_QUEUED:
+        c.chunks.append(bytes(indata))
+        c.event.set()
+        if not c.live.is_set():
+            c.live.set()
+
 def _do_start(path):
-    global _stream, _file
+    global _stream, _cap
     with _lock:
-        if _stream is not None:
+        if _stream is not None or _cap is not None:
             # Previous recording never got a "stop". Roll it over.
             _stop_locked()
+        cap = None
         try:
-            _file = open(path, "wb")
-            _stream = sd.InputStream(
-                samplerate=SR, channels=1, dtype="int16",
-                blocksize=0, callback=_cb,
-            )
-            _stream.start()
-            return "ok"
+            cap = _Capture(open(path, "wb"))
+            cap.thread = threading.Thread(target=cap.run, daemon=True)
+            cap.thread.start()
+            _cap = cap
+            err = None
+            for attempt in (1, 2):
+                _refresh_portaudio()
+                err = _open_verified(cap)
+                if err is None:
+                    return "ok"
+                sys.stderr.write("[child] open attempt %d failed: %s\n"
+                                 % (attempt, err))
+                sys.stderr.flush()
+            raise RuntimeError(err)
         except Exception as exc:
-            if _file is not None:
-                try: _file.close()
-                except Exception: pass
-                _file = None
             _stream = None
+            _cap = None
+            if cap is not None:
+                cap.finish()
             return "err start " + str(exc)[:160]
 
+# How long a freshly started stream gets to produce its first buffer. One
+# buffer is 32ms; a Bluetooth headset switching profile can take a couple of
+# seconds. Anything beyond this is a stream that opened but is not wired to a
+# working device.
+FIRST_AUDIO_TIMEOUT = 2.5
+
+
+def _refresh_portaudio():
+    # PortAudio enumerates CoreAudio devices once, at Pa_Initialize, and keeps
+    # those device object IDs for the life of the process. This child lives for
+    # days. Across a sleep, a lid close, or AirPods coming and going, CoreAudio
+    # hands out new IDs and the cached ones point at nothing: the next open
+    # fails with AUHAL '!obj' / -10851 / PaErrorCode -9986. That was the "first
+    # press of the day never records" bug — every one of those errors in the
+    # log followed an idle gap of 30 minutes to several hours.
+    #
+    # Re-initialising costs a few milliseconds, so do it before every open
+    # rather than trying to guess when the device list went stale.
+    #
+    # Pa_Terminate closes every open stream itself, so it must not race a
+    # close still running on a helper thread. Give those a moment to finish,
+    # and skip the refresh rather than risk a double close.
+    deadline = time.time() + 0.5
+    while _leaked and time.time() < deadline:
+        time.sleep(0.02)
+    if _leaked:
+        sys.stderr.write("[child] close still in flight; PortAudio not refreshed\n")
+        sys.stderr.flush()
+        return
+    try:
+        sd._terminate()
+        sd._initialize()
+    except Exception as exc:
+        sys.stderr.write("[child] PortAudio refresh failed: %s\n" % exc)
+        sys.stderr.flush()
+
+
+def _open_verified(cap):
+    # Open and start a stream, then wait for audio to actually arrive. Returns
+    # None on success (the stream is installed as _stream), otherwise a reason.
+    # Replying "ok" only once a buffer has landed is what lets the parent's
+    # recording indicator mean "you are being heard" rather than "we asked".
+    global _stream
+    try:
+        s = sd.InputStream(
+            samplerate=SR, channels=1, dtype="int16",
+            blocksize=BLOCKSIZE, callback=_cb,
+        )
+    except Exception as exc:
+        return str(exc)
+    try:
+        s.start()
+    except Exception as exc:
+        _release(s)
+        return str(exc)
+    if cap.live.wait(FIRST_AUDIO_TIMEOUT):
+        _stream = s
+        return None
+    _release(s)
+    return "input device opened but delivered no audio"
+
+
+def _release(s):
+    # Close on a helper thread, holding a strong ref. Closing releases the
+    # audio unit instead of stranding it for the life of the child; doing it
+    # off to the side means that even if Pa_CloseStream ever does wedge, it
+    # costs the parent nothing.
+    _leaked.append(s)
+    def _close(stream=s):
+        try:
+            stream.close()
+        except Exception:
+            pass
+        finally:
+            # Whether or not it raised, the close is over: holding the ref any
+            # longer would only block every later PortAudio refresh.
+            try: _leaked.remove(stream)
+            except ValueError: pass
+    threading.Thread(target=_close, daemon=True).start()
+
+
 def _stop_locked():
-    global _stream, _file
+    global _stream, _cap
     if _stream is not None:
         s = _stream
         _stream = None
         try:
-            s.stop()  # Never .close() — Pa_CloseStream hangs on macOS
+            # .stop() drains the buffer PortAudio is holding, so the tail of
+            # the dictation survives; .abort() would discard it. Measured at
+            # ~0.1s, comfortably inside the parent's budget.
+            s.stop()
         except Exception as exc:
             sys.stderr.write("[child] stop err: " + str(exc) + "\n")
             sys.stderr.flush()
-        _leaked.append(s)
-    if _file is not None:
-        try:
-            _file.flush()
-            _file.close()
-        except Exception: pass
-        _file = None
+        _release(s)
+    # After s.stop() no further callback can fire, so nothing more will be
+    # appended and finish() sees the complete recording.
+    cap = _cap
+    _cap = None
+    if cap is not None:
+        cap.finish()
 
 def _do_stop():
     with _lock:
@@ -941,7 +1114,14 @@ class _RecordService:
     # what made the mic indicator appear late, or not at all until the hotkey
     # was pressed a second time. Stop keeps the short timeout on purpose: a
     # hung stop must be SIGKILLed quickly or the mic is never released.
-    START_TIMEOUT = 4.0
+    #
+    # The child now also waits for the first audio buffer and, failing that,
+    # refreshes PortAudio and opens once more. Opens have been logged at up to
+    # 3.7s, so two attempts plus their first-audio waits need this much room.
+    START_TIMEOUT = 12.0
+
+    # Frames per PortAudio callback in the child. See BLOCKSIZE there.
+    BLOCKSIZE = 512
 
     # Lines the protocol recognises. Anything else on the channel is library
     # chatter and must be skipped rather than mistaken for a response.
@@ -951,13 +1131,19 @@ class _RecordService:
         self._proc: subprocess.Popen | None = None
         self._lines: "queue.Queue[str | None]" = queue.Queue()
         self._lock = threading.Lock()
+        # Warm-up runs on its own thread and must not be able to block, or
+        # deadlock with, a press that arrives while it is in flight — hence
+        # its own lock, held only to deduplicate warm-up threads.
+        self._warm_lock = threading.Lock()
+        self._warming: threading.Thread | None = None
+        self._closed = False
 
     # -- lifecycle ----------------------------------------------------
 
     def _spawn(self) -> None:
         proc = subprocess.Popen(
             [_child_python(), "-u", "-c", _AUDIO_CHILD_SCRIPT,
-             str(Recorder.SAMPLE_RATE)],
+             str(Recorder.SAMPLE_RATE), str(self.BLOCKSIZE)],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1037,6 +1223,46 @@ class _RecordService:
             print(f"[rec svc] ignoring stray output: {line[:120]!r}",
                   file=sys.stderr)
 
+    # -- keeping a child warm -----------------------------------------
+
+    def ensure_warm(self) -> None:
+        """
+        Make sure a live child is standing by, spawning one in the background
+        if not. Returns immediately; never blocks the caller.
+
+        This is the difference between a press that costs ~0.16s and one that
+        costs ~0.60s or worse. Spawning the child means starting a Python
+        interpreter, importing sounddevice and running Pa_Initialize, and
+        that used to land squarely on the press path every time the previous
+        recording ended with a SIGKILL — which is exactly the "hold the key
+        and the mic indicator takes ages to show up, but the second press is
+        fine" symptom: the second press was simply the one that found a warm
+        child. Warming after the kill instead of before the next open moves
+        that whole cost off the hot path.
+        """
+        if self._closed:
+            return
+        with self._warm_lock:
+            if self._warming is not None and self._warming.is_alive():
+                return
+            self._warming = threading.Thread(target=self._warm, daemon=True)
+            self._warming.start()
+
+    def _warm(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            if self._proc is not None and self._proc.poll() is None:
+                return
+            t0 = time.monotonic()
+            try:
+                self._spawn()
+            except Exception as exc:
+                print(f"[rec svc] warm-up failed: {exc}", file=sys.stderr)
+                return
+        print(f"[rec svc] warm child ready in {time.monotonic() - t0:.2f}s",
+              file=sys.stderr)
+
     def _send(self, cmd: str, timeout: float):
         if self._proc is None or self._proc.poll() is not None:
             self._spawn()
@@ -1062,14 +1288,29 @@ class _RecordService:
         except Exception:
             pass
         self._proc = None
+        # Rebuild the standby child right away rather than leaving the next
+        # press to pay for it. The warm thread takes the same lock we are
+        # holding, so it can't race a start/stop already in progress: it
+        # waits, then finds either a live child (no-op) or spawns one.
+        self.ensure_warm()
 
     # -- public API ---------------------------------------------------
 
     def start(self, path: str) -> bool:
         """Begin capture to `path` (raw 16-bit mono PCM). Returns True on success."""
         with self._lock:
+            t0 = time.monotonic()
+            warm = self._proc is not None and self._proc.poll() is None
             resp = self._send(f"start {path}", timeout=self.START_TIMEOUT)
             if resp == "ok":
+                # The number to look at when "the mic icon took ages": this
+                # is the whole press-to-capture cost, and whether the child
+                # had to be built first.
+                took = time.monotonic() - t0
+                if took > 0.75 or not warm:
+                    print(f"[rec svc] mic open took {took:.2f}s "
+                          f"({'warm' if warm else 'COLD — had to spawn'})",
+                          file=sys.stderr)
                 return True
 
             # The child must not be left holding the device: it may still be
@@ -1102,16 +1343,26 @@ class _RecordService:
         with self._lock:
             if self._proc is None or self._proc.poll() is not None:
                 return True
+            t0 = time.monotonic()
             resp = self._send("stop", timeout=self.CMD_TIMEOUT)
             if resp == "ok":
+                took = time.monotonic() - t0
+                if took > 0.75:
+                    print(f"[rec svc] slow stop: {took:.2f}s", file=sys.stderr)
                 return True
             # The child is stuck in PortAudio. SIGKILL is the only thing
             # that will reliably free the mic and clear the orange icon.
-            print(f"[rec svc] stop got {resp!r}; SIGKILL", file=sys.stderr)
+            # _kill() immediately warms a replacement, so this costs the mic
+            # for this clip but not the latency of the next press.
+            print(f"[rec svc] stop got {resp!r} after "
+                  f"{time.monotonic() - t0:.2f}s; SIGKILL", file=sys.stderr)
             self._kill()
             return False
 
     def shutdown(self) -> None:
+        # Set before anything else: _kill() re-warms by default, and a
+        # shutdown that keeps respawning children never finishes.
+        self._closed = True
         with self._lock:
             if self._proc is None:
                 return
@@ -1130,6 +1381,15 @@ class _RecordService:
 
 # Module-level singleton. Spawned lazily on first recording.
 _svc = _RecordService()
+
+
+def prewarm_recorder() -> None:
+    """
+    Build the capture child ahead of time so the first hotkey press doesn't.
+
+    Safe to call repeatedly and from any thread; returns immediately.
+    """
+    _svc.ensure_warm()
 
 
 class Recorder:
@@ -1204,33 +1464,88 @@ GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 STT_MODEL = "whisper-large-v3-turbo"
 
 
-def transcribe(wav_bytes: bytes, language: str | None = "en") -> str:
+class TranscriptionError(RuntimeError):
+    """The audio could not be transcribed (network, API), as opposed to
+    containing no speech."""
+
+
+# Seconds to wait before each retry of a failed upload. Right after a wake the
+# Wi-Fi is often still reconnecting and DNS fails outright ("nodename nor
+# servname provided"); a few seconds later the same request goes through.
+_STT_RETRY_DELAYS = (2.0, 4.0, 8.0)
+
+
+def transcribe(wav_bytes: bytes, language: str | None = "en",
+               raise_errors: bool = False) -> str:
+    """
+    Transcribe WAV bytes with Groq Whisper.
+
+    Returns "" for no key, no audio, or no speech. A request that fails
+    (after retrying transient network errors) also returns "" unless
+    `raise_errors` is set, in which case TranscriptionError is raised so the
+    caller can keep the audio instead of silently discarding it.
+    """
     key = groq_api_key()
     if not key:
         return ""
     if not wav_bytes:
         return ""
-    try:
-        data = {
-            "model": STT_MODEL,
-            "response_format": "json",
-            "temperature": "0",
-        }
-        # Omitting `language` lets Whisper auto-detect the spoken language.
-        if language:
-            data["language"] = language
-        with httpx.Client(timeout=30.0) as c:
-            r = c.post(
-                GROQ_URL,
-                headers={"Authorization": f"Bearer {key}"},
-                files={"file": ("rec.wav", wav_bytes, "audio/wav")},
-                data=data,
-            )
-            r.raise_for_status()
-            return (r.json().get("text") or "").strip()
-    except Exception as exc:
-        print(f"[stt] {exc}", file=sys.stderr)
-        return ""
+    data = {
+        "model": STT_MODEL,
+        "response_format": "json",
+        "temperature": "0",
+    }
+    # Omitting `language` lets Whisper auto-detect the spoken language.
+    if language:
+        data["language"] = language
+    last: Exception | None = None
+    for attempt, delay in enumerate((0.0,) + _STT_RETRY_DELAYS):
+        if delay:
+            time.sleep(delay)
+        try:
+            with httpx.Client(timeout=30.0) as c:
+                r = c.post(
+                    GROQ_URL,
+                    headers={"Authorization": f"Bearer {key}"},
+                    files={"file": ("rec.wav", wav_bytes, "audio/wav")},
+                    data=data,
+                )
+                r.raise_for_status()
+                return (r.json().get("text") or "").strip()
+        except httpx.TransportError as exc:
+            # Connection, DNS, timeouts: worth another go.
+            last = exc
+            print(f"[stt] attempt {attempt + 1}: {exc}", file=sys.stderr)
+        except httpx.HTTPStatusError as exc:
+            last = exc
+            print(f"[stt] {exc}", file=sys.stderr)
+            code = exc.response.status_code
+            if code != 429 and code < 500:
+                break   # bad key, bad request: retrying won't change it
+        except Exception as exc:
+            last = exc
+            print(f"[stt] {exc}", file=sys.stderr)
+            break
+    if raise_errors:
+        raise TranscriptionError(str(last) or type(last).__name__)
+    return ""
+
+
+UNSENT_DIR = CONFIG_DIR / "unsent-recordings"
+
+
+def save_unsent_recording(wav_bytes: bytes) -> Path:
+    """Keep a recording that could not be transcribed, so it isn't lost."""
+    UNSENT_DIR.mkdir(parents=True, exist_ok=True)
+    path = UNSENT_DIR / f"scribe-{datetime.now():%Y%m%d-%H%M%S}.wav"
+    path.write_bytes(wav_bytes)
+    # Bounded: keep the most recent 20.
+    for old in sorted(UNSENT_DIR.glob("scribe-*.wav"))[:-20]:
+        try:
+            old.unlink()
+        except Exception:
+            pass
+    return path
 
 
 # Whisper is famous for hallucinating these on silent / noisy clips.

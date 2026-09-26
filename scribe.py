@@ -41,6 +41,7 @@ NSBundle.mainBundle().infoDictionary()["LSUIElement"] = "1"
 
 import json
 import os
+import queue
 import re
 import signal
 import subprocess
@@ -69,6 +70,7 @@ from scribe_core import (
     OPENAI_MODELS,
     DEFAULT_TTS_INSTRUCTIONS,
     Recorder,
+    prewarm_recorder,
     load_dotenv as _load_dotenv,
     append_history,
     load_history,
@@ -110,8 +112,9 @@ from scribe_core import (
     effective_tts_voice,
     sync_speak_settings,
     transcribe,
+    TranscriptionError,
+    save_unsent_recording,
     is_garbage,
-    reset_portaudio,
 )
 
 from AppKit import (
@@ -654,6 +657,10 @@ class HotkeyWatcher:
 
 class ScribeApp(rumps.App):
     IDLE_TITLE = "🎙"
+    # Shown from the key press until the microphone has actually delivered
+    # audio. Opening can take seconds (a cold CoreAudio device, a Bluetooth
+    # headset switching profile), and anything said before 🔴 is not heard.
+    OPENING_TITLE = "⏳"
     REC_TITLE = "🔴"
     BUSY_TITLE = "✎"
 
@@ -684,6 +691,16 @@ class ScribeApp(rumps.App):
         self._pa_needs_reset = False
         self._rec_lock = threading.Lock()
         self._lang = load_stt_language("en")
+
+        # Push-to-talk press/release events, handled off the main thread by a
+        # single worker so ordering is preserved. See _on_fn_change.
+        self._rec_events: "queue.Queue[bool]" = queue.Queue()
+        threading.Thread(target=self._rec_event_loop, daemon=True).start()
+
+        # Build the audio capture child now, while the user is nowhere near
+        # the hotkey, so the first press doesn't pay for a Python start-up
+        # plus Pa_Initialize.
+        prewarm_recorder()
 
         # Back-to-back dictation space guard. We can't read the focused
         # field's caret without diving into the Accessibility API (and
@@ -1701,14 +1718,38 @@ class ScribeApp(rumps.App):
     # -- dictation flow ---------------------------------------------------
 
     def _on_fn_change(self, pressed: bool) -> None:
-        # Called from the event-tap thread. Hop to main thread for UI.
-        if pressed:
-            callAfter(self._start_recording)
-        else:
-            callAfter(self._stop_recording)
+        """
+        Called from the event-tap thread on every press/release of the
+        push-to-talk key. Must return immediately: macOS disables an event
+        tap whose callback runs long.
+
+        These used to be handed to the main thread with callAfter, which put
+        AppKit between the key press and Pa_OpenStream — the mic could not
+        start until the run loop got round to us, however busy the menubar
+        was. Nothing about opening an audio device needs the main thread, so
+        it now runs on our own worker and only the UI is marshalled.
+
+        One worker, fed by a queue, rather than a thread per event: press and
+        release MUST be handled in the order they happened. Two threads
+        racing could let the release run first, find nothing recording, and
+        return — leaving the mic live with no way to stop it.
+        """
+        self._rec_events.put(pressed)
+
+    def _rec_event_loop(self) -> None:
+        while True:
+            pressed = self._rec_events.get()
+            try:
+                if pressed:
+                    self._start_recording()
+                else:
+                    self._stop_recording()
+            except Exception as exc:
+                print(f"[rec] event {pressed}: {exc}", file=sys.stderr)
 
     def _start_recording(self) -> None:
-        # Main thread. Must return FAST — never call Pa_OpenStream here.
+        # Recording worker thread. Must return FAST so the matching release
+        # isn't held up — never call Pa_OpenStream here.
         with self._rec_lock:
             if self.recording or self._opening:
                 return
@@ -1718,12 +1759,20 @@ class ScribeApp(rumps.App):
             # previous clip cannot race with this one.
             rec = Recorder()
             self._active_recorder = rec
-        self.title = ScribeApp.REC_TITLE
-        hk_label = HOTKEYS[self.hotkey_id][2]
-        self.status_item.title = f"Listening… release {hk_label} to paste"
         threading.Thread(
             target=self._open_stream_worker, args=(rec,), daemon=True,
         ).start()
+        # UI last, and on the main thread where AppKit requires it. The mic
+        # is already opening by now; a congested run loop can delay the icon
+        # but no longer delays the recording itself.
+        # Not 🔴 yet: that waits for _open_stream_worker to confirm audio is
+        # arriving. Showing it here used to claim "recording" for seconds
+        # before the mic was open — or for a whole dictation when it never
+        # opened at all.
+        def _ui() -> None:
+            self.title = ScribeApp.OPENING_TITLE
+            self.status_item.title = "Opening mic… start speaking at 🔴"
+        callAfter(_ui)
 
     def _open_stream_worker(self, rec: Recorder) -> None:
         """
@@ -1731,9 +1780,8 @@ class ScribeApp(rumps.App):
         indefinitely when PortAudio is in a bad state — especially after
         a previous Pa_CloseStream orphaned its stream. Two defenses:
 
-        1. If the previous recording orphaned its close, hard-reset
-           PortAudio before trying to open. This releases the device
-           that the zombie stream was still holding.
+        1. If the previous recording ended badly, make sure a healthy
+           capture child is standing by before trying to open.
         2. A real watchdog: if opening doesn't complete in time, we
            give up, reset app state (self._opening, self._active_recorder)
            so the NEXT FN press is accepted, and let the zombie open
@@ -1744,13 +1792,18 @@ class ScribeApp(rumps.App):
         # (START_TIMEOUT + a SIGKILL reap), or this watchdog aborts a start
         # that the service was about to complete — the caller sees "mic
         # stuck" for what was only a cold CoreAudio open.
-        OPEN_TIMEOUT = 8.0
+        OPEN_TIMEOUT = 16.0
 
-        # Defense 1: recover from a previous orphaned close.
+        # Defense 1: recover from a previous bad ending.
+        #
+        # This used to call reset_portaudio(), which has been a documented
+        # no-op ever since PortAudio moved into the child — so the log line
+        # claiming a reset was reporting work that never happened, on the
+        # exact path being investigated. The real recovery is making sure a
+        # live child exists; SIGKILLing the old one is what frees the device.
         if self._pa_needs_reset:
             self._pa_needs_reset = False
-            print("[rec] resetting PortAudio before open", file=sys.stderr)
-            reset_portaudio()
+            prewarm_recorder()
 
         opened = threading.Event()
         aborted = threading.Event()
@@ -1817,6 +1870,13 @@ class ScribeApp(rumps.App):
                 callAfter(lambda: self._back_to_idle("Too short — ignored"))
                 return
             self.recording = True
+            # Queued while still holding the lock, so a release that follows
+            # can only queue its own UI update after this one.
+            hk_label = HOTKEYS[self.hotkey_id][2]
+            def _ui() -> None:
+                self.title = ScribeApp.REC_TITLE
+                self.status_item.title = f"Listening… release {hk_label} to paste"
+            callAfter(_ui)
 
     def _discard_stream(self, rec: Recorder) -> None:
         """Close a stream we no longer want, without transcribing."""
@@ -1848,8 +1908,12 @@ class ScribeApp(rumps.App):
             self._back_to_idle("Idle")
             return
         # Run transcription on a worker thread — we don't block the UI.
-        self.title = ScribeApp.BUSY_TITLE
-        self.status_item.title = "Transcribing…"
+        # This method no longer runs on the main thread, so the AppKit
+        # updates have to be marshalled explicitly.
+        def _ui() -> None:
+            self.title = ScribeApp.BUSY_TITLE
+            self.status_item.title = "Transcribing…"
+        callAfter(_ui)
         threading.Thread(
             target=self._finalize, args=(rec,), daemon=True,
         ).start()
@@ -1892,8 +1956,38 @@ class ScribeApp(rumps.App):
                 )
                 return
 
+            # The device opened and callbacks arrived, but every sample is
+            # zero: a muted or disconnected input. Whisper would hallucinate
+            # or return nothing, and the user would never know why.
+            if not wav[44:].strip(b"\x00"):
+                status = "⚠ Mic captured only silence"
+                rumps.notification(
+                    "Scribe heard nothing", "",
+                    "The microphone delivered pure silence. Check the input "
+                    "device in System Settings → Sound, then try again.",
+                )
+                return
+
             lang = None if self._lang == "auto" else self._lang
-            text = transcribe(wav, language=lang).strip()
+            try:
+                text = transcribe(wav, language=lang,
+                                  raise_errors=True).strip()
+            except TranscriptionError as exc:
+                # Typically the network isn't back yet after a wake. Don't
+                # throw away what may be minutes of dictation.
+                try:
+                    saved = str(save_unsent_recording(wav))
+                except Exception as save_exc:
+                    print(f"[unsent] {save_exc}", file=sys.stderr)
+                    saved = "(could not save the audio)"
+                print(f"[stt] giving up: {exc}; audio at {saved}",
+                      file=sys.stderr)
+                status = "⚠ Transcription failed — audio saved"
+                rumps.notification(
+                    "Scribe couldn't transcribe", "Recording saved",
+                    f"{str(exc)[:80]}\n{saved}",
+                )
+                return
             # Turn spoken "slash/dash/underscore/etc." into literal chars
             # before history, space-guard, and paste all see the same text.
             text = _apply_voice_tokens(text)
@@ -1936,6 +2030,10 @@ class ScribeApp(rumps.App):
             status = "Error — see log"
         finally:
             self._back_to_idle(status)
+            # A clean stop leaves the child alive and this does nothing. It
+            # earns its keep when the stop had to SIGKILL: the replacement is
+            # built here, during transcription, instead of on the next press.
+            prewarm_recorder()
 
     # -- back-to-back space guard ----------------------------------------
 
