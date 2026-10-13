@@ -111,6 +111,8 @@ from scribe_core import (
     resolve_tts_voice,
     effective_tts_voice,
     sync_speak_settings,
+    use_live_edge_endpoint,
+    edge_failure_reason,
     transcribe,
     TranscriptionError,
     save_unsent_recording,
@@ -160,6 +162,18 @@ _load_dotenv(DOTENV_FILE)
 
 EDGE_TTS_STREAM = Path.home() / "bin" / "edge-tts-stream"
 OPENAI_TTS_STREAM = Path.home() / "bin" / "openai-tts-stream"
+
+# Both helpers explain a failed synthesis in one "[…-tts] reason" stderr line.
+_RE_TTS_HELPER_ERROR = re.compile(r"^\[(?:edge|openai)-tts\] (.+)$", re.M)
+_TTS_ENGINE_NAMES = {"openai": "OpenAI", "edge": "Microsoft Edge"}
+
+
+def _tts_failure_reason(stderr_text: str, code: int) -> str:
+    """The helper's own explanation of why it failed, else its exit code."""
+    found = _RE_TTS_HELPER_ERROR.findall(stderr_text)
+    if found:
+        return found[-1].strip()[:200]
+    return f"The speech helper exited with code {code}."
 
 
 # ---------- TTS tuning presets (menu-driven, all persisted) ---------------
@@ -1569,12 +1583,17 @@ class ScribeApp(rumps.App):
                 cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 start_new_session=True,
                 env=env,
             )
             with self._tts_lock:
                 self._tts_proc = proc
+            # Drains stderr (so the pipe can never fill and wedge the child)
+            # and reports a helper that failed on its own.
+            threading.Thread(
+                target=self._watch_tts_proc, args=(proc, engine), daemon=True
+            ).start()
             try:
                 if proc.stdin is not None:
                     # errors="replace": clipboard text can carry lone
@@ -1595,6 +1614,25 @@ class ScribeApp(rumps.App):
             callAfter(lambda: rumps.notification(
                 "Read aloud failed", "", msg
             ))
+
+    def _watch_tts_proc(self, proc: subprocess.Popen, engine: str) -> None:
+        """Tell the user why a read-aloud produced no sound.
+
+        The helpers exit 1 when synthesis fails (service refused, no credits,
+        no network). A Stop — ours or another helper's — kills them by signal,
+        which shows up as a negative returncode and must stay quiet.
+        """
+        try:
+            err = proc.stderr.read() if proc.stderr is not None else b""
+        except Exception:
+            err = b""
+        code = proc.wait()
+        if code <= 0:
+            return
+        reason = _tts_failure_reason(err.decode("utf-8", "replace"), code)
+        name = _TTS_ENGINE_NAMES.get(engine, engine)
+        print(f"[tts] {name} failed: {reason}", file=sys.stderr)
+        callAfter(lambda: rumps.notification("Read aloud failed", name, reason))
 
     def _kill_tts_proc(self) -> None:
         """Kill the playback child we spawned, hard. Safe to call anytime."""
@@ -1682,6 +1720,7 @@ class ScribeApp(rumps.App):
         import asyncio
         import edge_tts
         try:
+            use_live_edge_endpoint()
             edge_voice, _ = resolve_tts_voice("edge", sample)
             out = b""
             async def run() -> None:
@@ -1710,7 +1749,11 @@ class ScribeApp(rumps.App):
             proc.wait()
             os.unlink(tmp)
         except Exception as exc:
-            print(f"[tts] {exc}", file=sys.stderr)
+            reason = edge_failure_reason(exc)
+            print(f"[tts] Microsoft Edge failed: {reason}", file=sys.stderr)
+            callAfter(lambda: rumps.notification(
+                "Read aloud failed", "Microsoft Edge", reason
+            ))
 
     def _quit(self, _sender) -> None:
         rumps.quit_application()

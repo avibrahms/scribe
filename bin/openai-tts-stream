@@ -293,8 +293,20 @@ def chunk_text(text):
     return [c.strip() for c in chunks if c.strip()]
 
 
+def api_error_message(body):
+    """The human-readable message inside an OpenAI error body, else the body."""
+    try:
+        return str(json.loads(body)["error"]["message"])
+    except Exception:
+        return body.strip()
+
+
 def stream_tts(text, voice, instructions, model, speed, api_key):
-    """Stream OpenAI TTS audio for each chunk into one continuous player."""
+    """Stream OpenAI TTS audio for each chunk into one continuous player.
+    Returns False if synthesis failed."""
+    # Failures are printed as a single "[openai-tts] reason" line: Scribe and
+    # speak-selection.sh show it to the user instead of staying silent.
+    ok = True
     player = subprocess.Popen(PLAYER_CMD, stdin=subprocess.PIPE)
     try:
         for chunk in chunk_text(text):
@@ -330,13 +342,16 @@ def stream_tts(text, voice, instructions, model, speed, api_key):
             except urllib.error.HTTPError as e:
                 detail = ""
                 try:
-                    detail = e.read().decode("utf-8", "replace")[:300]
+                    detail = api_error_message(e.read().decode("utf-8", "replace"))
                 except Exception:
                     pass
+                detail = " ".join(detail.split())[:300]
                 print(f"[openai-tts] HTTP {e.code}: {detail}", file=sys.stderr)
+                ok = False
                 break
             except urllib.error.URLError as e:
-                print(f"[openai-tts] network error: {e}", file=sys.stderr)
+                print(f"[openai-tts] network error: {e.reason}", file=sys.stderr)
+                ok = False
                 break
         try:
             player.stdin.close()
@@ -347,6 +362,7 @@ def stream_tts(text, voice, instructions, model, speed, api_key):
         pass
     except Exception as exc:
         print(f"[openai-tts] {exc}", file=sys.stderr)
+        ok = False
     finally:
         try:
             if player.stdin and not player.stdin.closed:
@@ -356,9 +372,11 @@ def stream_tts(text, voice, instructions, model, speed, api_key):
         if player.poll() is None:
             player.kill()
             player.wait()
+    return ok
 
 
 def main():
+    """Exit status: 1 when synthesis failed (reason on stderr), else 0."""
     args = parse_args()
 
     if args["stop"]:
@@ -386,7 +404,7 @@ def main():
         if not api_key:
             print("[openai-tts] no API key (set OPENAI_API_KEY or "
                   f"{KEY_FILE})", file=sys.stderr)
-            return
+            return 1
 
         settings = load_settings()
         voice = auto_voice(args["text"], settings, args["voice"])
@@ -404,7 +422,8 @@ def main():
             return
 
         try:
-            stream_tts(text, voice, instructions, model, speed, api_key)
+            if not stream_tts(text, voice, instructions, model, speed, api_key):
+                return 1
         except (KeyboardInterrupt, SystemExit):
             pass
     finally:
@@ -417,4 +436,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

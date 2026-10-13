@@ -42,6 +42,15 @@ fi
 [ -z "$TEXT" ] && exit 0
 
 # The helpers stop any current playback themselves, read voice/instructions
-# from settings.json, and clean up.
-printf '%s' "$TEXT" | "$HELPER" --stdin 2>/dev/null
+# from settings.json, and clean up. When synthesis fails they exit 1 with a
+# "[…-tts] reason" line on stderr (Stop kills them by signal instead), so say
+# why rather than leaving the hotkey silently dead.
+ERR="$(printf '%s' "$TEXT" | "$HELPER" --stdin 2>&1 >/dev/null)"
+if [ $? -eq 1 ]; then
+    REASON="$(printf '%s\n' "$ERR" | sed -n 's/^\[[a-z]*-tts\] //p' | tail -1)"
+    # Passed as an argument, never spliced into the AppleScript source.
+    osascript -e 'on run argv' \
+        -e 'display notification (item 1 of argv) with title "Read aloud failed"' \
+        -e 'end run' "${REASON:-The speech helper failed.}" >/dev/null 2>&1
+fi
 exit 0

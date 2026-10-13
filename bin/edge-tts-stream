@@ -385,10 +385,42 @@ def clean_text_for_speech(text):
     return text.strip()
 
 
-async def stream_tts(text, voice, rate, pitch, volume):
-    """Stream TTS audio to the player."""
-    import edge_tts
+# Microsoft stopped serving speech on speech.platform.bing.com in October
+# 2026: every synthesis handshake gets a 403 (rany2/edge-tts#490), and
+# edge-tts ≤ 7.2.8 still targets it. Edge itself moved to
+# api.msedgeservices.com, which accepts the same public client token under a
+# different parameter name. Mirrors scribe_core.use_live_edge_endpoint.
+RETIRED_SYNTH_HOST = "speech.platform.bing.com"
+SYNTH_URL = "wss://api.msedgeservices.com/tts/cognitiveservices/websocket/v1"
 
+
+def use_live_endpoint():
+    """Point edge-tts at the synthesis host Microsoft still serves. Only
+    rewrites while the installed library targets the retired host, so this
+    turns into a no-op once edge-tts ships its own fix."""
+    import edge_tts.communicate as comm
+    from edge_tts.constants import TRUSTED_CLIENT_TOKEN
+    if RETIRED_SYNTH_HOST in comm.WSS_URL:
+        comm.WSS_URL = (
+            f"{SYNTH_URL}?Ocp-Apim-Subscription-Key={TRUSTED_CLIENT_TOKEN}")
+
+
+def failure_reason(exc):
+    """One short, user-facing line for a failed synthesis."""
+    # aiohttp's handshake error stringifies to the whole signed URL; the
+    # status alone says everything worth showing.
+    status = getattr(exc, "status", None)
+    if status:
+        return f"Microsoft's voice service refused the request (HTTP {status})."
+    return (str(exc) or type(exc).__name__)[:160]
+
+
+async def stream_tts(text, voice, rate, pitch, volume):
+    """Stream TTS audio to the player. Returns False if synthesis failed."""
+    import edge_tts
+    use_live_endpoint()
+
+    ok = True
     player = subprocess.Popen(PLAYER_CMD, stdin=subprocess.PIPE)
     try:
         communicate = edge_tts.Communicate(
@@ -401,8 +433,11 @@ async def stream_tts(text, voice, rate, pitch, volume):
         player.wait()
     except BrokenPipeError:
         pass
-    except Exception:
-        pass
+    except Exception as exc:
+        # Scribe and speak-selection.sh show this line to the user, so a dead
+        # service is no longer indistinguishable from "nothing happened".
+        ok = False
+        print(f"[edge-tts] {failure_reason(exc)}", file=sys.stderr)
     finally:
         try:
             if player.stdin and not player.stdin.closed:
@@ -412,9 +447,11 @@ async def stream_tts(text, voice, rate, pitch, volume):
         if player.poll() is None:
             player.kill()
             player.wait()
+    return ok
 
 
 def main():
+    """Exit status: 1 when synthesis failed (reason on stderr), else 0."""
     args = parse_args()
 
     if args["stop"]:
@@ -456,7 +493,8 @@ def main():
 
         import asyncio
         try:
-            asyncio.run(stream_tts(text, voice, rate, pitch, volume))
+            if not asyncio.run(stream_tts(text, voice, rate, pitch, volume)):
+                return 1
         except (KeyboardInterrupt, SystemExit):
             pass
     finally:
@@ -472,4 +510,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

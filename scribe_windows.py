@@ -63,6 +63,8 @@ from scribe_core import (
     load_voice,
     save_stt_language,
     save_voice,
+    use_live_edge_endpoint,
+    edge_failure_reason,
     transcribe,
     is_garbage,
 )
@@ -503,6 +505,7 @@ class ScribeApp:
     def _speak_test(self) -> None:
         try:
             import edge_tts
+            use_live_edge_endpoint()
             out = b""
 
             async def run() -> None:
@@ -537,6 +540,7 @@ class ScribeApp:
                     pass
         except Exception as exc:
             print(f"[tts] {exc}", file=sys.stderr)
+            self._notify("Read aloud failed", edge_failure_reason(exc))
 
     def _on_copy_last(self, _icon, _item) -> None:
         rows = load_history(limit=1)

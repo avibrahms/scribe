@@ -354,6 +354,38 @@ DEFAULT_EDGE_RATE = "+0%"
 DEFAULT_EDGE_PITCH = "+0Hz"
 DEFAULT_EDGE_VOLUME = "+0%"
 
+# Microsoft stopped serving speech on speech.platform.bing.com in October
+# 2026: every synthesis handshake gets a 403 (rany2/edge-tts#490), and
+# edge-tts ≤ 7.2.8 still targets it. Edge itself moved to
+# api.msedgeservices.com, which accepts the same public client token under a
+# different parameter name. bin/edge-tts-stream carries its own copy.
+EDGE_RETIRED_SYNTH_HOST = "speech.platform.bing.com"
+EDGE_SYNTH_URL = "wss://api.msedgeservices.com/tts/cognitiveservices/websocket/v1"
+
+
+def use_live_edge_endpoint() -> None:
+    """Point edge-tts at the synthesis host Microsoft still serves.
+
+    Only rewrites while the installed library targets the retired host, so
+    this turns into a no-op once edge-tts ships its own fix.
+    """
+    import edge_tts.communicate as comm
+    from edge_tts.constants import TRUSTED_CLIENT_TOKEN
+    if EDGE_RETIRED_SYNTH_HOST in comm.WSS_URL:
+        comm.WSS_URL = (
+            f"{EDGE_SYNTH_URL}?Ocp-Apim-Subscription-Key={TRUSTED_CLIENT_TOKEN}"
+        )
+
+
+def edge_failure_reason(exc: Exception) -> str:
+    """One short, user-facing line for a failed Edge synthesis."""
+    # aiohttp's handshake error stringifies to the whole signed URL; the
+    # status alone says everything worth showing.
+    status = getattr(exc, "status", None)
+    if status:
+        return f"Microsoft's voice service refused the request (HTTP {status})."
+    return (str(exc) or type(exc).__name__)[:160]
+
 
 def load_tts_engine() -> str:
     cfg = load_cfg()
