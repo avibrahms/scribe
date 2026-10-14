@@ -63,7 +63,6 @@ from scribe_core import (
     load_voice,
     save_stt_language,
     save_voice,
-    use_live_edge_endpoint,
     edge_failure_reason,
     transcribe,
     is_garbage,
@@ -505,7 +504,6 @@ class ScribeApp:
     def _speak_test(self) -> None:
         try:
             import edge_tts
-            use_live_edge_endpoint()
             out = b""
 
             async def run() -> None:

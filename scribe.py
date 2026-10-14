@@ -48,7 +48,6 @@ import subprocess
 import sys
 import threading
 import time
-import uuid
 from pathlib import Path
 
 import rumps
@@ -111,8 +110,6 @@ from scribe_core import (
     resolve_tts_voice,
     effective_tts_voice,
     sync_speak_settings,
-    use_live_edge_endpoint,
-    edge_failure_reason,
     transcribe,
     TranscriptionError,
     save_unsent_recording,
@@ -728,7 +725,7 @@ class ScribeApp(rumps.App):
         self._last_paste_bundle: str | None = None
         self._last_paste_ts: float = 0.0
 
-        # The TTS playback child we spawned (edge-tts-stream or afplay).
+        # The TTS playback child we spawned (edge- or openai-tts-stream).
         # Stop must never depend solely on edge-tts-stream's PID file: a
         # child that wedges before writing it (seen in the wild, stuck in
         # sys.stdin.read()) is invisible to `--stop` forever. Holding the
@@ -1618,19 +1615,27 @@ class ScribeApp(rumps.App):
     def _watch_tts_proc(self, proc: subprocess.Popen, engine: str) -> None:
         """Tell the user why a read-aloud produced no sound.
 
-        The helpers exit 1 when synthesis fails (service refused, no credits,
-        no network). A Stop — ours or another helper's — kills them by signal,
-        which shows up as a negative returncode and must stay quiet.
+        The helpers fall back on their own (OpenAI → Edge → the Mac's voice)
+        and exit 1 only when nothing could read the text. A Stop — ours or
+        another helper's — kills them by signal, which shows up as a negative
+        returncode and must stay quiet.
         """
         try:
             err = proc.stderr.read() if proc.stderr is not None else b""
         except Exception:
             err = b""
         code = proc.wait()
-        if code <= 0:
+        name = _TTS_ENGINE_NAMES.get(engine, engine)
+        if code == 0:
+            # Spoke, but maybe through a fallback (Edge, the Mac's voice):
+            # the helpers have notified the user, keep the cause in the log.
+            for line in _RE_TTS_HELPER_ERROR.findall(err.decode("utf-8", "replace")):
+                print(f"[tts] {name} fell back: {line.strip()[:200]}",
+                      file=sys.stderr)
+            return
+        if code < 0:
             return
         reason = _tts_failure_reason(err.decode("utf-8", "replace"), code)
-        name = _TTS_ENGINE_NAMES.get(engine, engine)
         print(f"[tts] {name} failed: {reason}", file=sys.stderr)
         callAfter(lambda: rumps.notification("Read aloud failed", name, reason))
 
@@ -1690,6 +1695,7 @@ class ScribeApp(rumps.App):
             "openai-tts-stream --stdin",
             "openai-tts-stream --text",
             "/opt/homebrew/bin/play -t mp3",
+            "scribe-say-",  # the Mac-voice fallback's text file (tts_fallback)
         ):
             try:
                 subprocess.run(
@@ -1707,53 +1713,20 @@ class ScribeApp(rumps.App):
         threading.Thread(target=self._speak_test, daemon=True).start()
 
     def _speak_test(self) -> None:
-        # For the OpenAI engine, route the sample through the normal speak
-        # path so the test exercises the exact backend that Read aloud uses.
-        # The sample is English, so resolve it the same way Read aloud would:
-        # the test then previews the voice English actually speaks with, not
-        # whatever happens to be the default.
+        # Route the sample through the normal speak path so the test exercises
+        # the exact helper that Read aloud uses — including the Edge helper's
+        # self-upgrade when Microsoft changes its protocol. The sample is
+        # English, so resolve it the same way Read aloud would: the test then
+        # previews the voice English actually speaks with, not whatever
+        # happens to be the default.
         sample = "Notice how warm and natural this sounds."
         if self.tts_engine == "openai" and openai_api_key():
             voice, _ = resolve_tts_voice("openai", sample)
             self._speak_text(f"This is the {voice} voice. {sample}")
             return
-        import asyncio
-        import edge_tts
-        try:
-            use_live_edge_endpoint()
-            edge_voice, _ = resolve_tts_voice("edge", sample)
-            out = b""
-            async def run() -> None:
-                nonlocal out
-                c = edge_tts.Communicate(
-                    f"This is {edge_voice.split('-')[-1].replace('Neural','')}. Hello.",
-                    edge_voice,
-                    rate=self.edge_rate,
-                    pitch=self.edge_pitch,
-                    volume=self.edge_volume,
-                )
-                async for chunk in c.stream():
-                    if chunk["type"] == "audio":
-                        out += chunk["data"]
-            asyncio.run(run())
-            if not out:
-                return
-            tmp = f"/tmp/edgetts-v2-test-{uuid.uuid4().hex[:6]}.mp3"
-            with open(tmp, "wb") as f:
-                f.write(out)
-            # Track it like regular playback so Stop reading kills it too.
-            self._kill_tts_proc()
-            proc = subprocess.Popen(["afplay", tmp], start_new_session=True)
-            with self._tts_lock:
-                self._tts_proc = proc
-            proc.wait()
-            os.unlink(tmp)
-        except Exception as exc:
-            reason = edge_failure_reason(exc)
-            print(f"[tts] Microsoft Edge failed: {reason}", file=sys.stderr)
-            callAfter(lambda: rumps.notification(
-                "Read aloud failed", "Microsoft Edge", reason
-            ))
+        voice, _ = resolve_tts_voice("edge", sample)
+        name = voice.split("-")[-1].replace("Neural", "")
+        self._speak_text(f"This is {name}. {sample}")
 
     def _quit(self, _sender) -> None:
         rumps.quit_application()

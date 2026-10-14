@@ -131,6 +131,18 @@ try:
 except Exception:
     tts_lang = None
 
+# Shared fallbacks, deployed alongside. Optional too: without it a failure is
+# reported instead of handed on to the free Edge voice.
+try:
+    import tts_fallback
+except Exception:
+    tts_fallback = None
+
+# The free sibling that takes over when OpenAI can't speak (no key, no
+# credits, no network). It falls back further, to the Mac's voice, by itself.
+EDGE_HELPER = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "edge-tts-stream")
+
 
 def auto_voice(text, settings, explicit):
     """Voice to speak `text` with: an explicit --voice always wins.
@@ -303,13 +315,16 @@ def api_error_message(body):
 
 def stream_tts(text, voice, instructions, model, speed, api_key):
     """Stream OpenAI TTS audio for each chunk into one continuous player.
-    Returns False if synthesis failed."""
-    # Failures are printed as a single "[openai-tts] reason" line: Scribe and
-    # speak-selection.sh show it to the user instead of staying silent.
-    ok = True
-    player = subprocess.Popen(PLAYER_CMD, stdin=subprocess.PIPE)
+
+    Returns (reason, unread): why synthesis stopped and the text not yet
+    spoken, or (None, "") when it all played or a Stop cut it short.
+    """
+    chunks = chunk_text(text)
+    played = 0  # chunks that reached the player in full
+    reason = None
+    player = None
     try:
-        for chunk in chunk_text(text):
+        for chunk in chunks:
             body = {
                 "model": model,
                 "voice": voice,
@@ -337,6 +352,12 @@ def stream_tts(text, voice, instructions, model, speed, api_key):
                         block = resp.read(8192)
                         if not block:
                             break
+                        if player is None:
+                            # Started on the first audio, so a refused
+                            # request never leaves an empty player printing
+                            # half a line into our stderr.
+                            player = subprocess.Popen(
+                                PLAYER_CMD, stdin=subprocess.PIPE)
                         player.stdin.write(block)
                         player.stdin.flush()
             except urllib.error.HTTPError as e:
@@ -346,37 +367,56 @@ def stream_tts(text, voice, instructions, model, speed, api_key):
                 except Exception:
                     pass
                 detail = " ".join(detail.split())[:300]
-                print(f"[openai-tts] HTTP {e.code}: {detail}", file=sys.stderr)
-                ok = False
+                reason = f"HTTP {e.code}: {detail}"
                 break
             except urllib.error.URLError as e:
-                print(f"[openai-tts] network error: {e.reason}", file=sys.stderr)
-                ok = False
+                reason = f"network error: {e.reason}"
                 break
-        try:
+            played += 1
+        if reason is None and player is not None:
             player.stdin.close()
-        except Exception:
-            pass
-        player.wait()
+            if player.wait() > 0:
+                reason = f"The audio player failed (exit {player.returncode})."
     except BrokenPipeError:
-        pass
+        # Killed by a signal = a Stop, which takes us down with it anyway.
+        if player.wait() > 0:
+            reason = "The audio player quit unexpectedly."
     except Exception as exc:
-        print(f"[openai-tts] {exc}", file=sys.stderr)
-        ok = False
+        reason = str(exc) or type(exc).__name__
     finally:
-        try:
-            if player.stdin and not player.stdin.closed:
-                player.stdin.close()
-        except Exception:
-            pass
-        if player.poll() is None:
-            player.kill()
-            player.wait()
-    return ok
+        if player is not None:
+            try:
+                if player.stdin and not player.stdin.closed:
+                    player.stdin.close()
+            except Exception:
+                pass
+            if player.poll() is None:
+                player.kill()
+                player.wait()
+    if reason is None:
+        return None, ""
+    return reason, "\n\n".join(chunks[played:])
+
+
+def hand_off_to_edge(text, reason):
+    """Read the text with the free Edge helper instead.
+
+    Replaces this process (same pid and process group, so a Stop still
+    reaches it) and returns only when Edge can't be started.
+    """
+    if tts_fallback is None or not os.access(EDGE_HELPER, os.X_OK):
+        return
+    tts_fallback.notify("Read aloud: using Microsoft Edge",
+                        f"OpenAI failed: {reason}")
+    try:
+        tts_fallback.exec_with_stdin([EDGE_HELPER, "--stdin"], text)
+    except OSError:
+        pass
 
 
 def main():
-    """Exit status: 1 when synthesis failed (reason on stderr), else 0."""
+    """Exit status: 1 when nothing could read the text (reason on stderr),
+    else 0."""
     args = parse_args()
 
     if args["stop"]:
@@ -402,8 +442,9 @@ def main():
 
         api_key = load_api_key()
         if not api_key:
-            print("[openai-tts] no API key (set OPENAI_API_KEY or "
-                  f"{KEY_FILE})", file=sys.stderr)
+            reason = f"no API key (set OPENAI_API_KEY or {KEY_FILE})"
+            print(f"[openai-tts] {reason}", file=sys.stderr)
+            hand_off_to_edge(args["text"], reason)
             return 1
 
         settings = load_settings()
@@ -422,10 +463,17 @@ def main():
             return
 
         try:
-            if not stream_tts(text, voice, instructions, model, speed, api_key):
-                return 1
+            reason, unread = stream_tts(
+                text, voice, instructions, model, speed, api_key)
         except (KeyboardInterrupt, SystemExit):
-            pass
+            return
+        if reason is None:
+            return
+        # Scribe and speak-selection.sh show this line to the user when
+        # nothing else speaks either, so a failure is never silent.
+        print(f"[openai-tts] {reason}", file=sys.stderr)
+        hand_off_to_edge(unread, reason)
+        return 1
     finally:
         try:
             with open(PID_FILE) as f:

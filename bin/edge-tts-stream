@@ -101,6 +101,13 @@ try:
 except Exception:
     tts_lang = None
 
+# Shared fallbacks (the Mac's own voice, notifications), deployed alongside.
+# Optional too: without it a failure is reported instead of worked around.
+try:
+    import tts_fallback
+except Exception:
+    tts_fallback = None
+
 
 def auto_voice(text, settings, explicit):
     """Voice to speak `text` with: an explicit --voice always wins.
@@ -385,24 +392,105 @@ def clean_text_for_speech(text):
     return text.strip()
 
 
-# Microsoft stopped serving speech on speech.platform.bing.com in October
-# 2026: every synthesis handshake gets a 403 (rany2/edge-tts#490), and
-# edge-tts ≤ 7.2.8 still targets it. Edge itself moved to
-# api.msedgeservices.com, which accepts the same public client token under a
-# different parameter name. Mirrors scribe_core.use_live_edge_endpoint.
-RETIRED_SYNTH_HOST = "speech.platform.bing.com"
-SYNTH_URL = "wss://api.msedgeservices.com/tts/cognitiveservices/websocket/v1"
+# Read aloud must not hinge on any one thing Microsoft controls. In order:
+#   1. every synthesis endpoint, starting with the last one that worked;
+#   2. if they all refuse (or edge-tts is missing), a freshly upgraded
+#      edge-tts. Microsoft changes what it accepts every few months (October
+#      2026: a new Sec-MS-GEC token), upstream usually ships the fix within a
+#      day or two, and nothing else would ever install it here;
+#   3. the Mac's own voice (tts_fallback), which needs no network at all.
+
+# Every host Microsoft has served the read-aloud voices from, as templates on
+# the library's public client token. The installed library's own URL is tried
+# too, so a host a future edge-tts moves to needs no edit here.
+EDGE_ENDPOINTS = (
+    "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud"
+    "/edge/v1?TrustedClientToken={token}",
+    "wss://api.msedgeservices.com/tts/cognitiveservices/websocket/v1"
+    "?Ocp-Apim-Subscription-Key={token}",
+)
+LAST_ENDPOINT_FILE = os.path.join(CONFIG_DIR, "edge-endpoint")
+# Per endpoint: a host that hangs must not hold up the next one.
+CONNECT_TIMEOUT = 5
+
+# A refusal upgrades edge-tts at most once an hour, so an outage costs one pip
+# check an hour rather than one per read.
+UPGRADE_STAMP = os.path.join(CONFIG_DIR, "edge-tts-upgrade.stamp")
+UPGRADE_INTERVAL = 3600
+UPGRADE_TIMEOUT = 180
 
 
-def use_live_endpoint():
-    """Point edge-tts at the synthesis host Microsoft still serves. Only
-    rewrites while the installed library targets the retired host, so this
-    turns into a no-op once edge-tts ships its own fix."""
+class PlayerError(Exception):
+    """The audio player failed: no endpoint can fix that."""
+
+
+def endpoints():
+    """Synthesis URLs to try, in order: the last one that worked, the
+    installed library's own, then every known host."""
     import edge_tts.communicate as comm
     from edge_tts.constants import TRUSTED_CLIENT_TOKEN
-    if RETIRED_SYNTH_HOST in comm.WSS_URL:
-        comm.WSS_URL = (
-            f"{SYNTH_URL}?Ocp-Apim-Subscription-Key={TRUSTED_CLIENT_TOKEN}")
+    urls = []
+    try:
+        with open(LAST_ENDPOINT_FILE) as f:
+            urls.append(f.read().strip())
+    except OSError:
+        pass
+    urls.append(comm.WSS_URL)
+    urls += [t.format(token=TRUSTED_CLIENT_TOKEN) for t in EDGE_ENDPOINTS]
+    return [u for u in dict.fromkeys(urls) if u.startswith("wss://")]
+
+
+def remember_endpoint(url):
+    """Try this endpoint first next time: a dead one then costs one failed
+    handshake, once, instead of one on every read."""
+    try:
+        with open(LAST_ENDPOINT_FILE) as f:
+            if f.read().strip() == url:
+                return
+    except OSError:
+        pass
+    try:
+        with open(LAST_ENDPOINT_FILE, "w") as f:
+            f.write(url)
+    except OSError:
+        pass
+
+
+def edge_tts_version():
+    """Installed edge-tts version, read fresh from disk."""
+    import importlib
+    import importlib.metadata
+    importlib.invalidate_caches()
+    try:
+        return importlib.metadata.version("edge-tts")
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def upgrade_edge_tts():
+    """Install the newest edge-tts into this interpreter's environment.
+    Returns True when a different version is now installed."""
+    try:
+        if time.time() - os.path.getmtime(UPGRADE_STAMP) < UPGRADE_INTERVAL:
+            return False
+    except OSError:
+        pass
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(UPGRADE_STAMP, "w"):
+        pass
+    before = edge_tts_version()
+    try:
+        # Own session, never killed: a Stop kills our process group, and pip
+        # killed mid-install would leave edge-tts half-written for good.
+        pip = subprocess.Popen(
+            [sys.executable, "-m", "pip", "install", "--quiet",
+             "--disable-pip-version-check", "--upgrade", "edge-tts"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True)
+        pip.wait(timeout=UPGRADE_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return edge_tts_version() != before
 
 
 def failure_reason(exc):
@@ -412,46 +500,115 @@ def failure_reason(exc):
     status = getattr(exc, "status", None)
     if status:
         return f"Microsoft's voice service refused the request (HTTP {status})."
+    if isinstance(exc, ImportError):
+        return "The edge-tts library is missing or broken."
     return (str(exc) or type(exc).__name__)[:160]
 
 
-async def stream_tts(text, voice, rate, pitch, volume):
-    """Stream TTS audio to the player. Returns False if synthesis failed."""
-    import edge_tts
-    use_live_endpoint()
+async def stream_tts(text, voice, rate, pitch, volume, url):
+    """Stream TTS audio from one endpoint to the player.
 
-    ok = True
-    player = subprocess.Popen(PLAYER_CMD, stdin=subprocess.PIPE)
+    Returns (error, played): the exception that stopped synthesis or None,
+    and whether any audio reached the player. Once it has, starting over
+    elsewhere would read the beginning twice.
+    """
+    from contextlib import aclosing
+    import edge_tts
+    import edge_tts.communicate as comm
+    comm.WSS_URL = url
+
+    error = None
+    player = None
     try:
         communicate = edge_tts.Communicate(
-            text, voice, rate=rate, pitch=pitch, volume=volume)
-        async for chunk in communicate.stream():
-            if chunk["type"] == "audio":
+            text, voice, rate=rate, pitch=pitch, volume=volume,
+            connect_timeout=CONNECT_TIMEOUT)
+        # aclosing: leaving the loop early must still close the connection.
+        async with aclosing(communicate.stream()) as stream:
+            async for chunk in stream:
+                if chunk["type"] != "audio":
+                    continue
+                if player is None:
+                    # Started on the first audio, so an endpoint that refuses
+                    # never leaves an empty player complaining on stderr.
+                    try:
+                        player = subprocess.Popen(
+                            PLAYER_CMD, stdin=subprocess.PIPE)
+                    except OSError as exc:
+                        raise PlayerError(
+                            f"Can't start the audio player: {exc}")
                 player.stdin.write(chunk["data"])
                 player.stdin.flush()
-        player.stdin.close()
-        player.wait()
+        if player is not None:
+            player.stdin.close()
+            if player.wait() > 0:
+                raise PlayerError(
+                    f"The audio player failed (exit {player.returncode}).")
     except BrokenPipeError:
-        pass
+        # Killed by a signal = a Stop, which takes us down with it anyway.
+        if player.wait() > 0:
+            error = PlayerError("The audio player quit unexpectedly.")
     except Exception as exc:
-        # Scribe and speak-selection.sh show this line to the user, so a dead
-        # service is no longer indistinguishable from "nothing happened".
-        ok = False
-        print(f"[edge-tts] {failure_reason(exc)}", file=sys.stderr)
+        error = exc
     finally:
-        try:
-            if player.stdin and not player.stdin.closed:
-                player.stdin.close()
-        except Exception:
-            pass
-        if player.poll() is None:
-            player.kill()
-            player.wait()
-    return ok
+        if player is not None:
+            try:
+                if player.stdin and not player.stdin.closed:
+                    player.stdin.close()
+            except Exception:
+                pass
+            if player.poll() is None:
+                player.kill()
+                player.wait()
+    return error, player is not None
+
+
+def speak_edge(text, voice, rate, pitch, volume):
+    """Try each endpoint until one speaks.
+
+    Returns (spoke, errors, played): errors holds every failed attempt, also
+    the ones before an endpoint that worked.
+    """
+    import asyncio
+    try:
+        urls = endpoints()
+    except ImportError as exc:
+        return False, [exc], False
+    errors = []
+    rate_limited = set()
+    while urls:
+        url = urls.pop(0)
+        error, played = asyncio.run(
+            stream_tts(text, voice, rate, pitch, volume, url))
+        if error is None:
+            remember_endpoint(url)
+            return True, errors, played
+        errors.append(error)
+        if played or isinstance(error, PlayerError):
+            return False, errors, played
+        # 429 Too Many Requests is often momentary (Microsoft throttles
+        # clients it is phasing out): one more try once the others are done.
+        if getattr(error, "status", None) == 429 and url not in rate_limited:
+            rate_limited.add(url)
+            urls.append(url)
+    return False, errors, False
+
+
+def worth_upgrading(errors):
+    """An HTTP refusal is how a Microsoft protocol change shows up, and a
+    missing library is reinstalled by the same pip run."""
+    return any(getattr(e, "status", None) or isinstance(e, ImportError)
+               for e in errors)
+
+
+def voice_locale(voice):
+    """"fr-FR-HenriNeural" -> "fr-FR"."""
+    return "-".join(voice.split("-")[:2])
 
 
 def main():
-    """Exit status: 1 when synthesis failed (reason on stderr), else 0."""
+    """Exit status: 1 when nothing could read the text (reason on stderr),
+    else 0."""
     args = parse_args()
 
     if args["stop"]:
@@ -491,12 +648,40 @@ def main():
         if not text:
             return
 
-        import asyncio
         try:
-            if not asyncio.run(stream_tts(text, voice, rate, pitch, volume)):
-                return 1
+            spoke, errors, played = speak_edge(
+                text, voice, rate, pitch, volume)
         except (KeyboardInterrupt, SystemExit):
-            pass
+            return
+        if spoke:
+            # A refusal on the way there means this edge-tts is falling
+            # behind Microsoft: update it now, while nobody waits on it.
+            if worth_upgrading(errors):
+                upgrade_edge_tts()
+            return
+        if (tts_fallback is not None and not played
+                and worth_upgrading(errors) and upgrade_edge_tts()):
+            # A fresh process, so the upgraded edge-tts is the one imported.
+            tts_fallback.exec_with_stdin(
+                [sys.executable, os.path.abspath(__file__), "--stdin",
+                 "--voice", voice, "--rate", rate, "--pitch", pitch,
+                 "--volume", volume],
+                args["text"])
+        reason = failure_reason(errors[-1])
+        # Scribe and speak-selection.sh show this line to the user when
+        # nothing else speaks either, so a dead service is never silent.
+        print(f"[edge-tts] {reason}", file=sys.stderr)
+        if played and not isinstance(errors[-1], PlayerError):
+            return 1  # cut off mid-read: another voice would start it over
+        if tts_fallback is None:
+            return 1
+        tts_fallback.notify("Read aloud: using the Mac's voice",
+                            f"Microsoft Edge failed: {reason}")
+        if tts_fallback.speak_with_system_voice(text, voice_locale(voice)):
+            return 0
+        print(f"[edge-tts] {reason} The Mac's own voice failed too.",
+              file=sys.stderr)
+        return 1
     finally:
         # Only remove the PID file if it still points at us — a newer
         # speak process may have replaced it, and deleting that entry
