@@ -81,6 +81,9 @@ from scribe_core import (
     load_stt_language,
     load_voice,
     save_stt_language,
+    load_input_device,
+    save_input_device,
+    list_input_devices,
     save_voice,
     load_tts_engine,
     save_tts_engine,
@@ -125,7 +128,7 @@ from AppKit import (
     NSSound,
 )
 from contextlib import contextmanager
-from Foundation import NSURL
+from Foundation import NSURL, NSObject
 from PyObjCTools.AppHelper import callAfter
 from Quartz import (
     CGEventTapCreate,
@@ -664,6 +667,15 @@ class HotkeyWatcher:
         CFRunLoopRun()
 
 
+class _MenuOpenWatcher(NSObject):
+    """NSMenu delegate that calls `self.callback()` each time the menu opens."""
+
+    def menuWillOpen_(self, _menu) -> None:  # noqa: N802 (Cocoa selector)
+        cb = getattr(self, "callback", None)
+        if cb is not None:
+            cb()
+
+
 # ---------- rumps app -----------------------------------------------------
 
 class ScribeApp(rumps.App):
@@ -744,6 +756,11 @@ class ScribeApp(rumps.App):
         self.edge_pitch = load_edge_pitch()
         self.edge_volume = load_edge_volume()
         self.hotkey_id = load_hotkey_id()
+        # Dictation input, by name ("" = system default). The names connected
+        # right now are read in the background; None until the first read.
+        self.input_device = load_input_device()
+        self._input_names: list[str] | None = None
+        self._listing_inputs = False
 
         # Per-language voice picking. The menu keeps no state of its own —
         # these registries let _refresh_voice_marks re-derive every check
@@ -758,6 +775,7 @@ class ScribeApp(rumps.App):
 
         self._build_menu()
         self._refresh_autodetect_marks()
+        self._refresh_inputs()
 
         # Hotkey watcher on background thread. Handles both the push-to-talk
         # modifier and the global ⌃⌘V "paste last transcript" shortcut.
@@ -873,6 +891,15 @@ class ScribeApp(rumps.App):
                 mi.state = 1
             self.lang_menu.add(mi)
 
+        # Microphone picker. The choice is Scribe's own, so a Bluetooth
+        # headset that macOS makes the default again on reconnect doesn't
+        # take dictation with it. Re-read from the system each time it opens.
+        self.mic_menu = rumps.MenuItem("Microphone")
+        self._fill_mic_menu()
+        self._mic_menu_watcher = _MenuOpenWatcher.alloc().init()
+        self._mic_menu_watcher.callback = self._refresh_inputs
+        self.mic_menu._menu.setDelegate_(self._mic_menu_watcher)
+
         # History submenu (the "Paste last transcript  ⌃⌘V" entry lives
         # inside this submenu — see _refresh_history_menu).
         self.history_menu = rumps.MenuItem("History")
@@ -917,6 +944,7 @@ class ScribeApp(rumps.App):
             None,
             self.hotkey_menu,
             self.lang_menu,
+            self.mic_menu,
             self.history_menu,
             None,
             self.perms_item,
@@ -1256,6 +1284,54 @@ class ScribeApp(rumps.App):
             self._lang = code
             save_stt_language(code)
         return cb
+
+    def _fill_mic_menu(self) -> None:
+        if getattr(self.mic_menu, "_menu", None) is not None:
+            self.mic_menu.clear()
+        default = rumps.MenuItem("System default (follows macOS)",
+                                 callback=self._make_mic_cb(""))
+        default.state = int(not self.input_device)
+        self.mic_menu.add(default)
+        self.mic_menu.add(None)
+        connected = self._input_names
+        names = list(connected or [])
+        if self.input_device and self.input_device not in names:
+            names.append(self.input_device)
+        for name in names:
+            title = name
+            if connected is not None and name not in connected:
+                title = f"{name} — not connected, using the default"
+            mi = rumps.MenuItem(title, callback=self._make_mic_cb(name))
+            mi.state = int(name == self.input_device)
+            self.mic_menu.add(mi)
+
+    def _make_mic_cb(self, name: str):
+        def cb(_sender: rumps.MenuItem) -> None:
+            self.input_device = name
+            save_input_device(name)
+            self._fill_mic_menu()
+        return cb
+
+    def _refresh_inputs(self) -> None:
+        # Listing starts a process and talks to CoreAudio: never on the main
+        # thread. The menu is only rebuilt when the list actually changed.
+        if self._listing_inputs:
+            return
+        self._listing_inputs = True
+
+        def work() -> None:
+            try:
+                names = list_input_devices()
+            finally:
+                self._listing_inputs = False
+            if names is None or names == self._input_names:
+                return
+
+            def ui() -> None:
+                self._input_names = names
+                self._fill_mic_menu()
+            callAfter(ui)
+        threading.Thread(target=work, daemon=True).start()
 
     def _make_copy_cb(self, text: str):
         def cb(_sender: rumps.MenuItem) -> None:
@@ -1808,7 +1884,7 @@ class ScribeApp(rumps.App):
         # (START_TIMEOUT + a SIGKILL reap), or this watchdog aborts a start
         # that the service was about to complete — the caller sees "mic
         # stuck" for what was only a cold CoreAudio open.
-        OPEN_TIMEOUT = 16.0
+        OPEN_TIMEOUT = 18.0
 
         # Defense 1: recover from a previous bad ending.
         #

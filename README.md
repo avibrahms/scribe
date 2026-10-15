@@ -129,6 +129,7 @@ Windows has no TCC/permissions system to grant — Scribe just works. Caveats:
 - **Re-paste the last transcript**: `⌃⌘V` on macOS, `Ctrl+Alt+V` on Windows.
 - **Change hotkey**: tray menu → *Dictation Hotkey*. Options differ slightly per OS (macOS has Fn/🌐 + left/right modifiers; Windows has left/right Alt/Ctrl/Shift/Win).
 - **Change dictation language**: tray menu → *Dictation Language*.
+- **Choose the microphone** (macOS): menu → *Microphone*. The choice is kept even when macOS makes a reconnecting Bluetooth headset the default input again; *System default* follows macOS. A Bluetooth mic needs a moment to wake up, so wait for 🔴 before speaking, and Scribe keeps listening 0.4s after you release the key to catch the words still on their way. Built-in and USB mics get neither delay.
 - **Speak text aloud**: tray menu → *Test Voice*, or *Read selected text* (⌃D) / *Read copied text* (⌃X).
 - **Set a voice per language**: tray menu → *OpenAI TTS — tuning* or *Microsoft Edge TTS — tuning* → *Voice* → pick a voice inside a language's submenu.
 - **Browse history**: tray menu → *History*. Click any entry to copy it.

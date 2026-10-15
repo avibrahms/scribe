@@ -214,6 +214,48 @@ def save_stt_language(language: str) -> None:
     save_cfg(cfg)
 
 
+# The microphone dictation records from, by device name; "" follows the
+# system default. Kept by Scribe rather than left to the OS because macOS
+# makes a reconnecting Bluetooth headset the default input again, and that
+# headset is the slowest, most clipped input there is.
+def load_input_device() -> str:
+    return str(load_cfg().get("input_device", "")).strip()
+
+
+def save_input_device(name: str) -> None:
+    cfg = load_cfg()
+    cfg["input_device"] = name.strip()
+    save_cfg(cfg)
+
+
+# Run in a throwaway interpreter: PortAudio lists devices once per process, so
+# a fresh one sees the headset that connected a minute ago, and a query hung
+# in CoreAudio can simply be abandoned (see _RecordService). The list goes on
+# the last line: PortAudio may print warnings to stdout.
+_LIST_INPUTS_SCRIPT = (
+    "import json, sounddevice as sd\n"
+    "names = []\n"
+    "for d in sd.query_devices():\n"
+    "    if d['max_input_channels'] > 0 and d['name'] not in names:\n"
+    "        names.append(d['name'])\n"
+    "print(json.dumps(names))\n"
+)
+
+
+def list_input_devices(timeout: float = 5.0) -> list[str] | None:
+    """Names of the connected input devices, or None if they couldn't be read."""
+    try:
+        out = subprocess.run(
+            [_child_python(), "-c", _LIST_INPUTS_SCRIPT],
+            capture_output=True, timeout=timeout,
+        ).stdout.decode(errors="replace").strip().splitlines()
+        names = json.loads(out[-1]) if out else None
+        return [str(n) for n in names] if isinstance(names, list) else None
+    except Exception as exc:
+        print(f"[mic] could not list input devices: {exc}", file=sys.stderr)
+        return None
+
+
 def groq_api_key() -> str:
     k = (os.environ.get("GROQ_API_KEY") or "").strip()
     if k:
@@ -866,6 +908,8 @@ class _Capture(object):
         # Set by the first callback: proof the device is really delivering
         # audio, as opposed to merely having accepted Pa_StartStream.
         self.live = threading.Event()
+        # Set by the first buffer holding a non-zero sample. See AUDIBLE_TIMEOUT.
+        self.audible = threading.Event()
         self.capturing = True
         self.thread = None
 
@@ -914,13 +958,20 @@ def _cb(indata, frames, t, status):
     # Real-time thread. Append and return — nothing blocking, ever.
     c = _cap
     if c is not None and c.capturing and len(c.chunks) < _MAX_QUEUED:
-        c.chunks.append(bytes(indata))
+        chunk = bytes(indata)
+        c.chunks.append(chunk)
         c.event.set()
         if not c.live.is_set():
             c.live.set()
+        # Only scanned until the first sound, and count() is a C loop.
+        if not c.audible.is_set() and chunk.count(0) != len(chunk):
+            c.audible.set()
 
-def _do_start(path):
+def _do_start(arg):
     global _stream, _cap
+    # "start <path>" or "start <path>\t<input device name>". Temp paths never
+    # hold a tab; device names may hold spaces.
+    path, _, device = arg.partition("\t")
     with _lock:
         if _stream is not None or _cap is not None:
             # Previous recording never got a "stop". Roll it over.
@@ -934,7 +985,7 @@ def _do_start(path):
             err = None
             for attempt in (1, 2):
                 _refresh_portaudio()
-                err = _open_verified(cap)
+                err = _open_verified(cap, device)
                 if err is None:
                     return "ok"
                 sys.stderr.write("[child] open attempt %d failed: %s\n"
@@ -953,6 +1004,83 @@ def _do_start(path):
 # seconds. Anything beyond this is a stream that opened but is not wired to a
 # working device.
 FIRST_AUDIO_TIMEOUT = 2.5
+
+# How long a stream that is delivering buffers gets to deliver actual sound.
+# A Bluetooth headset hands over its first buffers before its microphone link
+# is up, and they are pure digital zeros: measured on an "Air Free" headset,
+# 0.5-0.8s of exact zeros after the first callback whenever the headset had
+# gone idle, where the built-in mic has room noise in its very first buffer.
+# Replying "ok" on the first callback turned 🔴 on while the headset was still
+# sending nothing, so the first words spoken at 🔴 were never recorded.
+#
+# Nothing is added for a mic that is already sending sound: the wait ends on
+# the first non-zero sample, which for the built-in mic is the first buffer.
+# A mic that stays at exact zero (muted, or a dead input) still gets its "ok"
+# when this runs out, and the parent's silence check reports it as before.
+AUDIBLE_TIMEOUT = 2.0
+
+# Seconds of capture kept after the key is released, for Bluetooth inputs
+# only. Bluetooth delivers the voice late, and the headset reports a latency
+# of 0.03s it doesn't have, so the device can't be asked. Stopping the instant
+# the key came up cut off the last words ("...is it clear?") still in flight
+# over the radio. A built-in, USB or virtual input gets no tail: its audio is
+# already in hand when the key comes up.
+BLUETOOTH_TAIL = float(sys.argv[3]) if len(sys.argv) > 3 else 0.0
+_tail = 0.0   # the tail for the stream now in _stream
+
+
+def _input_index(name):
+    # PortAudio renumbers devices on every refresh, so a chosen input is
+    # remembered by name and looked up again for each open. None means the
+    # system default, which is also the answer when the chosen one is gone.
+    if not name:
+        return None
+    for i, d in enumerate(sd.query_devices()):
+        if d["name"] == name and d["max_input_channels"] > 0:
+            return i
+    sys.stderr.write("[child] %r is not connected; using the system default input\n"
+                     % name)
+    sys.stderr.flush()
+    return None
+
+
+_ca = None   # (PortAudio, CoreAudio, AudioObjectPropertyAddress) via ctypes
+
+def _is_bluetooth(s):
+    # Asks CoreAudio how the device the stream actually opened is attached,
+    # rather than guessing from its name. macOS only; elsewhere, no tail.
+    global _ca
+    if sys.platform != "darwin":
+        return False
+    try:
+        import ctypes, struct
+        code = lambda s4: struct.unpack(">I", s4.encode())[0]
+        if _ca is None:
+            class Addr(ctypes.Structure):
+                _fields_ = [("selector", ctypes.c_uint32),
+                            ("scope", ctypes.c_uint32),
+                            ("element", ctypes.c_uint32)]
+            pa = ctypes.CDLL(sd._libname)
+            pa.PaMacCore_GetStreamInputDevice.restype = ctypes.c_uint32
+            pa.PaMacCore_GetStreamInputDevice.argtypes = [ctypes.c_void_p]
+            ca = ctypes.CDLL("/System/Library/Frameworks/CoreAudio.framework/CoreAudio")
+            ca.AudioObjectGetPropertyData.argtypes = [
+                ctypes.c_uint32, ctypes.POINTER(Addr), ctypes.c_uint32,
+                ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32), ctypes.c_void_p]
+            _ca = (pa, ca, Addr)
+        pa, ca, Addr = _ca
+        dev = pa.PaMacCore_GetStreamInputDevice(
+            int(sd._ffi.cast("uintptr_t", s._ptr)))
+        addr = Addr(code("tran"), code("glob"), 0)
+        val, size = ctypes.c_uint32(0), ctypes.c_uint32(4)
+        if ca.AudioObjectGetPropertyData(dev, ctypes.byref(addr), 0, None,
+                                         ctypes.byref(size), ctypes.byref(val)):
+            return False
+        return val.value in (code("blue"), code("blea"))   # Classic, LE
+    except Exception as exc:
+        sys.stderr.write("[child] transport check failed: %s\n" % exc)
+        sys.stderr.flush()
+        return False
 
 
 def _refresh_portaudio():
@@ -985,16 +1113,16 @@ def _refresh_portaudio():
         sys.stderr.flush()
 
 
-def _open_verified(cap):
+def _open_verified(cap, device):
     # Open and start a stream, then wait for audio to actually arrive. Returns
     # None on success (the stream is installed as _stream), otherwise a reason.
     # Replying "ok" only once a buffer has landed is what lets the parent's
     # recording indicator mean "you are being heard" rather than "we asked".
-    global _stream
+    global _stream, _tail
     try:
         s = sd.InputStream(
             samplerate=SR, channels=1, dtype="int16",
-            blocksize=BLOCKSIZE, callback=_cb,
+            blocksize=BLOCKSIZE, callback=_cb, device=_input_index(device),
         )
     except Exception as exc:
         return str(exc)
@@ -1003,11 +1131,19 @@ def _open_verified(cap):
     except Exception as exc:
         _release(s)
         return str(exc)
-    if cap.live.wait(FIRST_AUDIO_TIMEOUT):
-        _stream = s
-        return None
-    _release(s)
-    return "input device opened but delivered no audio"
+    if not cap.live.wait(FIRST_AUDIO_TIMEOUT):
+        _release(s)
+        return "input device opened but delivered no audio"
+    _stream = s
+    _tail = BLUETOOTH_TAIL if BLUETOOTH_TAIL > 0 and _is_bluetooth(s) else 0.0
+    t0 = time.time()
+    heard = cap.audible.wait(AUDIBLE_TIMEOUT)
+    waited = time.time() - t0
+    if not heard or waited > 0.25:
+        sys.stderr.write("[child] input sent only zeros for %.2fs after opening%s\n"
+                         % (waited, "" if heard else " (muted or dead input?)"))
+        sys.stderr.flush()
+    return None
 
 
 def _release(s):
@@ -1051,6 +1187,11 @@ def _stop_locked():
         cap.finish()
 
 def _do_stop():
+    # Outside the lock: the callback keeps appending meanwhile, and the
+    # parent holds its own lock for the whole command, so no start can slip
+    # in before this stop has finished.
+    if _stream is not None and _tail > 0:
+        time.sleep(_tail)
     with _lock:
         _stop_locked()
         return "ok"
@@ -1073,7 +1214,8 @@ def _main():
         elif cmd == "stop":
             resp = _do_stop()
         elif cmd == "quit":
-            _do_stop()
+            with _lock:
+                _stop_locked()   # no tail: nobody is mid-sentence at quit
             _reply("ok")
             break
         else:
@@ -1126,11 +1268,17 @@ class _RecordService:
     #
     # The child now also waits for the first audio buffer and, failing that,
     # refreshes PortAudio and opens once more. Opens have been logged at up to
-    # 3.7s, so two attempts plus their first-audio waits need this much room.
-    START_TIMEOUT = 12.0
+    # 3.7s, so two attempts plus their first-audio waits need this much room,
+    # plus the child's AUDIBLE_TIMEOUT for a successful open.
+    START_TIMEOUT = 14.0
 
     # Frames per PortAudio callback in the child. See BLOCKSIZE there.
     BLOCKSIZE = 512
+
+    # Capture kept after the key comes up when the input is Bluetooth. See
+    # BLUETOOTH_TAIL in the child. Spent inside the stop command, so the stop
+    # timeout grows by the same amount.
+    BLUETOOTH_TAIL = 0.4
 
     # Lines the protocol recognises. Anything else on the channel is library
     # chatter and must be skipped rather than mistaken for a response.
@@ -1152,7 +1300,8 @@ class _RecordService:
     def _spawn(self) -> None:
         proc = subprocess.Popen(
             [_child_python(), "-u", "-c", _AUDIO_CHILD_SCRIPT,
-             str(Recorder.SAMPLE_RATE), str(self.BLOCKSIZE)],
+             str(Recorder.SAMPLE_RATE), str(self.BLOCKSIZE),
+             str(self.BLUETOOTH_TAIL)],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1305,12 +1454,17 @@ class _RecordService:
 
     # -- public API ---------------------------------------------------
 
-    def start(self, path: str) -> bool:
-        """Begin capture to `path` (raw 16-bit mono PCM). Returns True on success."""
+    def start(self, path: str, device: str = "") -> bool:
+        """
+        Begin capture to `path` (raw 16-bit mono PCM) from the input named
+        `device`, or the system default when empty or not connected. Returns
+        True on success.
+        """
+        cmd = f"start {path}\t{device}" if device else f"start {path}"
         with self._lock:
             t0 = time.monotonic()
             warm = self._proc is not None and self._proc.poll() is None
-            resp = self._send(f"start {path}", timeout=self.START_TIMEOUT)
+            resp = self._send(cmd, timeout=self.START_TIMEOUT)
             if resp == "ok":
                 # The number to look at when "the mic icon took ages": this
                 # is the whole press-to-capture cost, and whether the child
@@ -1337,7 +1491,7 @@ class _RecordService:
             if resp is None and alive:
                 return False
             try:
-                resp = self._send(f"start {path}", timeout=self.START_TIMEOUT)
+                resp = self._send(cmd, timeout=self.START_TIMEOUT)
             except Exception as exc:
                 print(f"[rec svc] respawn start failed: {exc}", file=sys.stderr)
                 return False
@@ -1353,10 +1507,10 @@ class _RecordService:
             if self._proc is None or self._proc.poll() is not None:
                 return True
             t0 = time.monotonic()
-            resp = self._send("stop", timeout=self.CMD_TIMEOUT)
+            resp = self._send("stop", timeout=self.CMD_TIMEOUT + self.BLUETOOTH_TAIL)
             if resp == "ok":
                 took = time.monotonic() - t0
-                if took > 0.75:
+                if took > 0.75 + self.BLUETOOTH_TAIL:
                     print(f"[rec svc] slow stop: {took:.2f}s", file=sys.stderr)
                 return True
             # The child is stuck in PortAudio. SIGKILL is the only thing
@@ -1431,7 +1585,7 @@ class Recorder:
         self._tmp_path = tmp.name
         tmp.close()
         self._started_at = time.time()
-        if not _svc.start(self._tmp_path):
+        if not _svc.start(self._tmp_path, load_input_device()):
             # Clean up the empty temp file so it doesn't leak.
             try: os.unlink(self._tmp_path)
             except Exception: pass
