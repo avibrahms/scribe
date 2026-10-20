@@ -25,6 +25,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -1676,6 +1677,65 @@ class TranscriptionError(RuntimeError):
 _STT_RETRY_DELAYS = (2.0, 4.0, 8.0)
 
 
+_CLOUD_WORD = re.compile(r"\bcloud\b", re.IGNORECASE)
+_LITERAL_CLOUD = re.compile(r"\bliteral\s+cloud\b", re.IGNORECASE)
+_CLOUD_BRAND_BEFORE = re.compile(
+    r"\b(?:google|amazon|aws|azure|microsoft|alibaba|oracle)\s+$",
+    re.IGNORECASE,
+)
+_CLOUD_BEFORE = re.compile(
+    r"(?:\b(?:google|icloud|amazon|aws|azure|microsoft|alibaba|oracle|"
+    r"public|private|hybrid|multi|the|a|storm|rain|dark|white|fluffy|"
+    r"cumulus|cumulonimbus|cirrus|stratus)\s+|"
+    r"\b(?:in|to|from|on|into)\s+the\s+)$", re.IGNORECASE,
+)
+_CLOUD_AFTER = re.compile(
+    r"^[\s-]+(?:computing|storage|infrastructure|hosting|hosted|provider|"
+    r"providers|platform|platforms|service|services|server|servers|"
+    r"deployment|migration|native|based|backup|backups|security|"
+    r"architecture|engineer|engineering|costs|billing|resources|"
+    r"function|functions|run|sql|console|formation|cover|"
+    r"of|in\s+the\s+sky)\b", re.IGNORECASE,
+)
+_CLAUDE_AFTER = re.compile(
+    r"^[\s-]+(?:code|cowork|opus|sonnet|haiku)\b", re.IGNORECASE,
+)
+
+
+def correct_dictation_terms(text: str) -> str:
+    """Prefer Avi's frequent 'Claude', preserving local cloud contexts.
+
+    Runs once before history/paste on both platforms. No model, network,
+    or full-transcript topic inference: one mention of storage must not
+    prevent a separate mention of Claude from being corrected.
+    Say 'literal cloud' to force the ordinary word in any context.
+    Plurals, compound words, and already-correct 'Claude' are untouched.
+    """
+    literal_spans = {m.end() - 5: m.start()
+                     for m in _LITERAL_CLOUD.finditer(text)}
+
+    def replace(match: re.Match) -> str:
+        start, end = match.span()
+        before, after = text[max(0, start - 60):start], text[end:end + 60]
+        if start in literal_spans:
+            return match.group()
+        # Protect addresses, paths, and identifiers from prose corrections.
+        if ((start and text[start - 1] in "/.@_-")
+                or (end < len(text) and text[end] in "/@_")
+                or re.match(r"^\.[A-Za-z0-9]", after)):
+            return match.group()
+        if _CLOUD_BRAND_BEFORE.search(before):
+            return match.group()
+        if _CLAUDE_AFTER.match(after):
+            return "Claude"
+        if _CLOUD_BEFORE.search(before) or _CLOUD_AFTER.match(after):
+            return match.group()
+        return "Claude"
+
+    corrected = _CLOUD_WORD.sub(replace, text)
+    return _LITERAL_CLOUD.sub(lambda m: m.group()[-5:], corrected)
+
+
 def transcribe(wav_bytes: bytes, language: str | None = "en",
                raise_errors: bool = False) -> str:
     """
@@ -1712,7 +1772,9 @@ def transcribe(wav_bytes: bytes, language: str | None = "en",
                     data=data,
                 )
                 r.raise_for_status()
-                return (r.json().get("text") or "").strip()
+                return correct_dictation_terms(
+                    (r.json().get("text") or "").strip()
+                )
         except httpx.TransportError as exc:
             # Connection, DNS, timeouts: worth another go.
             last = exc

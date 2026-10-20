@@ -27,6 +27,7 @@ Wispr Flow is great, but it's **$12/month**, proprietary, and sends your audio a
 ## How it works
 
 - **STT (dictation)**: hold a modifier key (default: Right ⌥/Alt) → record via `sounddevice` → send WAV to **Groq's free Whisper API** (`whisper-large-v3-turbo`) → snapshot the clipboard → paste the transcript → restore your clipboard.
+- **Claude / cloud**: before saving or pasting, a local correction prefers **Claude** for ambiguous singular “cloud,” including “cloud code” → “Claude code.” Common cloud computing/weather phrases (such as “cloud storage,” “Google Cloud,” and “a cloud”) and addresses stay intact. Say **“literal cloud”** to force “cloud”; “literal” is removed. These lightweight English context rules add no API calls and cannot resolve every homophone perfectly.
 - **TTS (read-aloud)**: any selected text → choose your engine from the menu (**TTS Engine**):
   - **OpenAI** (default) — `gpt-4o-mini-tts`: very natural, emotionally expressive voices (Coral, Nova, Shimmer, Sage, Ash, Onyx, Fable, …). Needs an OpenAI API key (set it via *Set OpenAI API key…*); costs ~$0.015/min.
   - **Microsoft Edge** — free, unlimited Edge neural voices (Ava, Andrew, Brian, Emma, William, Sonia, Natasha, Denise, Elvira, Katja, Elsa, etc.), no API key.
