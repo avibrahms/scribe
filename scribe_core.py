@@ -877,6 +877,7 @@ SR = int(sys.argv[1])
 BLOCKSIZE = int(sys.argv[2]) if len(sys.argv) > 2 else 512
 
 _stream = None
+_stream_rate = SR
 # Strong refs to streams whose close is still in flight (or wedged), so
 # Python's GC can't run __del__ → Pa_CloseStream underneath us.
 _leaked = []
@@ -984,10 +985,17 @@ def _do_start(arg):
             _cap = cap
             err = None
             for attempt in (1, 2):
+                t0 = time.monotonic()
                 _refresh_portaudio()
+                refreshed = time.monotonic()
                 err = _open_verified(cap, device)
+                elapsed = time.monotonic() - t0
+                if elapsed > 0.75:
+                    sys.stderr.write("[child] start timing: refresh=%.3fs open=%.3fs\n"
+                                     % (refreshed - t0, time.monotonic() - refreshed))
+                    sys.stderr.flush()
                 if err is None:
-                    return "ok"
+                    return "ok rate=%d" % _stream_rate
                 sys.stderr.write("[child] open attempt %d failed: %s\n"
                                  % (attempt, err))
                 sys.stderr.flush()
@@ -1118,24 +1126,39 @@ def _open_verified(cap, device):
     # None on success (the stream is installed as _stream), otherwise a reason.
     # Replying "ok" only once a buffer has landed is what lets the parent's
     # recording indicator mean "you are being heard" rather than "we asked".
-    global _stream, _tail
+    global _stream, _tail, _stream_rate
+    t0 = time.monotonic()
     try:
+        index = _input_index(device)
+        # Capture in the device's native format on macOS. Asking CoreAudio
+        # for 16kHz on a 48kHz microphone creates a converter and an extra
+        # ring buffer during every open. Windows retains its existing path.
+        rate = (int(sd.query_devices(index, "input")["default_samplerate"])
+                if sys.platform == "darwin" else SR)
         s = sd.InputStream(
-            samplerate=SR, channels=1, dtype="int16",
-            blocksize=BLOCKSIZE, callback=_cb, device=_input_index(device),
+            samplerate=rate, channels=1, dtype="int16",
+            blocksize=BLOCKSIZE, callback=_cb, device=index,
         )
     except Exception as exc:
         return str(exc)
+    constructed = time.monotonic()
     try:
         s.start()
     except Exception as exc:
         _release(s)
         return str(exc)
+    started = time.monotonic()
     if not cap.live.wait(FIRST_AUDIO_TIMEOUT):
         _release(s)
         return "input device opened but delivered no audio"
     _stream = s
+    _stream_rate = int(s.samplerate)
+    delivered = time.monotonic()
     _tail = BLUETOOTH_TAIL if BLUETOOTH_TAIL > 0 and _is_bluetooth(s) else 0.0
+    if delivered - t0 > 0.75:
+        sys.stderr.write("[child] input timing: construct=%.3fs start=%.3fs first-buffer=%.3fs\n"
+                         % (constructed - t0, started - constructed, delivered - started))
+        sys.stderr.flush()
     t0 = time.time()
     heard = cap.audible.wait(AUDIBLE_TIMEOUT)
     waited = time.time() - t0
@@ -1171,9 +1194,9 @@ def _stop_locked():
         s = _stream
         _stream = None
         try:
-            # .stop() drains the buffer PortAudio is holding, so the tail of
-            # the dictation survives; .abort() would discard it. Measured at
-            # ~0.1s, comfortably inside the parent's budget.
+            # Preserve graceful stopping. On CoreAudio, abort() uses the
+            # same underlying stop/reset path and does not avoid its stalls.
+            # Bluetooth's delivery tail has already elapsed in _do_stop.
             s.stop()
         except Exception as exc:
             sys.stderr.write("[child] stop err: " + str(exc) + "\n")
@@ -1294,6 +1317,7 @@ class _RecordService:
         self._warm_lock = threading.Lock()
         self._warming: threading.Thread | None = None
         self._closed = False
+        self.sample_rate = 16000
 
     # -- lifecycle ----------------------------------------------------
 
@@ -1376,7 +1400,7 @@ class _RecordService:
                 return None
             if line is None:
                 return None
-            if line in self._TOKENS or line.startswith("err"):
+            if line in self._TOKENS or line.startswith(("err", "ok rate=")):
                 return line
             print(f"[rec svc] ignoring stray output: {line[:120]!r}",
                   file=sys.stderr)
@@ -1454,6 +1478,18 @@ class _RecordService:
 
     # -- public API ---------------------------------------------------
 
+    def _accept_start(self, response: str | None) -> bool:
+        if response is None or not response.startswith("ok rate="):
+            return False
+        try:
+            rate = int(response.removeprefix("ok rate="))
+        except ValueError:
+            return False
+        if rate <= 0:
+            return False
+        self.sample_rate = rate
+        return True
+
     def start(self, path: str, device: str = "") -> bool:
         """
         Begin capture to `path` (raw 16-bit mono PCM) from the input named
@@ -1465,7 +1501,7 @@ class _RecordService:
             t0 = time.monotonic()
             warm = self._proc is not None and self._proc.poll() is None
             resp = self._send(cmd, timeout=self.START_TIMEOUT)
-            if resp == "ok":
+            if self._accept_start(resp):
                 # The number to look at when "the mic icon took ages": this
                 # is the whole press-to-capture cost, and whether the child
                 # had to be built first.
@@ -1495,7 +1531,7 @@ class _RecordService:
             except Exception as exc:
                 print(f"[rec svc] respawn start failed: {exc}", file=sys.stderr)
                 return False
-            return resp == "ok"
+            return self._accept_start(resp)
 
     def stop(self) -> bool:
         """
@@ -1574,6 +1610,7 @@ class Recorder:
     def __init__(self) -> None:
         self._tmp_path: str | None = None
         self._started_at: float = 0.0
+        self._sample_rate = self.SAMPLE_RATE
         # True when the service had to be SIGKILLed because it hung.
         # Whatever PCM made it to disk is still read and transcribed.
         self.orphaned: bool = False
@@ -1591,6 +1628,7 @@ class Recorder:
             except Exception: pass
             self._tmp_path = None
             raise RuntimeError("audio service failed to start recording")
+        self._sample_rate = _svc.sample_rate
 
     def stop(self, timeout: float | None = None) -> tuple[bytes, int]:
         duration_ms = int((time.time() - self._started_at) * 1000)
@@ -1616,7 +1654,7 @@ class Recorder:
         with wave.open(buf, "wb") as w:
             w.setnchannels(1)
             w.setsampwidth(2)
-            w.setframerate(self.SAMPLE_RATE)
+            w.setframerate(self._sample_rate)
             w.writeframes(data)
         return buf.getvalue(), duration_ms
 
