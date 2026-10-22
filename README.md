@@ -37,6 +37,7 @@ Wispr Flow is great, but it's **$12/month**, proprietary, and sends your audio a
 
   Detection is offline and dependency-free (`bin/tts_lang.py`) — no text is sent anywhere to identify it. It covers the languages Scribe ships voices for (English, French, Spanish, German, Italian) and deliberately answers "unsure" rather than guessing, in which case the default voice is used. The app and the standalone ⌃D/⌃X helpers share the one detector, so both pick the same voice for the same text. macOS only for now — the Windows tray app keeps the single-voice behaviour.
 - **Read aloud never goes silent**: when an engine can't speak, the next one takes over and a notification says why. OpenAI (no key, no credits, no network) hands the unread text to Edge. Edge tries every Microsoft endpoint, starting with the last one that worked; if Microsoft refuses them all (it changes its protocol every few months), the helper upgrades its own `edge-tts` — at most once an hour — and tries again. When even that fails, the Mac's built-in voice reads the text, in the text's language (`bin/tts_fallback.py`, macOS only). A *Read aloud failed* notification only appears when nothing at all could speak.
+- **Read the way a person would**: before any engine speaks, the text is prepared for the ear (`bin/tts_text.py`, shared by both helpers). Markdown and URLs are tidied, `3s` / `500ms` / `1h30` are read as "3 seconds", "500 milliseconds", "1 hour 30" (in the text's language; "the 80s" stays a decade), and arrows (`->`, `→`, `⇒`, `➤`, …), emoji and bullets between words become a short pause instead of running the words together; `↑`/`↓` read as "up"/"down", and `⌘⇧V` as "Command Shift V". "AVI" is read as the name Avi, never spelled out. Tables are read row by row, with a short pause between each column name and its value and a ✓/✗ cell read as "yes"/"no". Headings and list items get a full stop, so a list isn't read as one long sentence.
 - **Hotkey observation**: a listen-only global key watcher (`CGEventTap` on macOS, `pynput` on Windows) — never intercepts or blocks keystrokes.
 - **Persistence**: auto-starts at login (`launchd` on macOS, Startup-folder shortcut on Windows).
 
@@ -48,6 +49,7 @@ scribe.py                 — macOS entry (rumps / AppKit / Quartz)
 scribe_windows.py         — Windows entry (pystray / pynput / pyperclip)
 bin/tts_lang.py           — offline language detector, shared by the app + helpers
 bin/tts_fallback.py       — fallbacks shared by the helpers (Mac voice, notifications)
+bin/tts_text.py           — text preparation shared by the helpers (tables, symbols, units)
 bin/edge-tts-stream       — standalone Edge TTS helper (⌃D / ⌃X Quick Actions)
 bin/openai-tts-stream     — standalone OpenAI TTS helper
 bin/speak-selection.sh    — routes the Quick Actions to the selected engine

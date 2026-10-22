@@ -138,6 +138,13 @@ try:
 except Exception:
     tts_fallback = None
 
+# Shared text preparation (markdown, tables, symbols, units), deployed
+# alongside. Optional too: without it the text is read as written.
+try:
+    import tts_text
+except Exception:
+    tts_text = None
+
 # The free sibling that takes over when OpenAI can't speak (no key, no
 # credits, no network). It falls back further, to the Mac's voice, by itself.
 EDGE_HELPER = os.path.join(
@@ -199,81 +206,6 @@ def load_api_key():
             return f.read().strip()
     except OSError:
         return ""
-
-
-# --- Text cleaning for speech (mirrors edge-tts-stream) -------------------
-
-_RE_MD_IMAGE = re.compile(r'!\[([^\]]*)\]\([^)]+\)')
-_RE_MD_LINK = re.compile(r'\[([^\]]*)\]\([^)]+\)')
-_RE_HTML_TAG = re.compile(r'<[^>]+>')
-_RE_CODE_FENCE = re.compile(r'```[a-zA-Z]*')
-_RE_HEADING = re.compile(r'(?m)^#{1,6}\s+')
-_RE_BLOCKQUOTE = re.compile(r'(?m)^>\s*')
-_RE_BULLET = re.compile(r'(?m)^[\-\*]\s+')
-_RE_NUMBERED = re.compile(r'(?m)^\d+\.\s+')
-_RE_BOLD_ITALIC = re.compile(
-    r'(?<!\w)[_*]{1,3}(?!\w)|(?<!\w)[_*]{1,3}(?=\w)|(?<=\w)[_*]{1,3}(?!\w)')
-_RE_INLINE_CODE = re.compile(r'`([^`]+)`')
-_RE_HR = re.compile(r'(?m)^[\-\*_]{3,}\s*$')
-_RE_URL = re.compile(r'https?://([^\s\)\]]+)')
-_RE_NOISE = re.compile(r'[|~\\]')
-_RE_EMOJI = re.compile(
-    r'[\U0001F600-\U0001F64F'
-    r'\U0001F300-\U0001F5FF'
-    r'\U0001F680-\U0001F6FF'
-    r'\U0001F1E0-\U0001F1FF'
-    r'\U0001F900-\U0001F9FF'
-    r'\U0001FA00-\U0001FA6F'
-    r'\U0001FA70-\U0001FAFF'
-    r'\U00002702-\U000027B0'
-    r'\U0000FE00-\U0000FE0F'
-    r'\U0000200D'
-    r'\U000020E3'
-    r'\U00002600-\U000026FF'
-    r'\U00002300-\U000023FF'
-    r'\U00002B50-\U00002B55'
-    r'\U0000203C-\U00003299'
-    r']+', re.UNICODE
-)
-_RE_MULTI_SPACE = re.compile(r'[ \t]{2,}')
-_RE_MULTI_NEWLINE = re.compile(r'\n{3,}')
-
-
-def _humanize_url(match):
-    url = match.group(1).rstrip('.,;:!?')
-    url = re.sub(r'^www\.', '', url)
-    parts = url.split('/', 1)
-    domain = parts[0].replace('.', ' dot ')
-    if len(parts) > 1 and parts[1]:
-        path = parts[1].strip('/')
-        path = path.replace('_', ' ').replace('-', ' ').replace('/', ', ')
-        path = re.sub(r'\.([a-zA-Z]{2,4})$', r' dot \1', path)
-        path = re.sub(r'[?#].*', '', path)
-        if path.strip():
-            return f"{domain}, {path}"
-    return domain
-
-
-def clean_text_for_speech(text):
-    text = _RE_EMOJI.sub('', text)
-    text = _RE_MD_IMAGE.sub(r'\1', text)
-    text = _RE_MD_LINK.sub(r'\1', text)
-    text = _RE_HTML_TAG.sub('', text)
-    text = _RE_CODE_FENCE.sub('', text)
-    text = _RE_HR.sub('', text)
-    text = _RE_HEADING.sub('', text)
-    text = _RE_BLOCKQUOTE.sub('', text)
-    text = _RE_BULLET.sub('', text)
-    text = _RE_NUMBERED.sub('', text)
-    text = _RE_INLINE_CODE.sub(r'\1', text)
-    text = _RE_BOLD_ITALIC.sub('', text)
-    text = _RE_URL.sub(_humanize_url, text)
-    text = re.sub(r'(?<=\w)_(?=\w)', ' ', text)
-    text = _RE_NOISE.sub('', text)
-    text = re.sub(r'(?<!\w)#(?!\w)', '', text)
-    text = _RE_MULTI_SPACE.sub(' ', text)
-    text = _RE_MULTI_NEWLINE.sub('\n\n', text)
-    return text.strip()
 
 
 _RE_SENTENCE = re.compile(r'(.+?(?:[.!?。！？\n]+|$))', re.S)
@@ -458,7 +390,9 @@ def main():
             speed = 1.0
         speed = min(4.0, max(0.25, speed))
 
-        text = clean_text_for_speech(args["text"])
+        text = (tts_text.clean_text_for_speech(
+                    args["text"], tts_text.speech_lang(args["text"], None))
+                if tts_text is not None else args["text"].strip())
         if not text:
             return
 
