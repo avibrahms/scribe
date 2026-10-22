@@ -21,6 +21,10 @@ except Exception:
 # disappears next to punctuation or a line edge (a private-use code point,
 # so it never collides with real text).
 PAUSE = ""
+# A longer silence than any punctuation gets from the voice: between table
+# rows, so the ear hears where one row ends. Kept on a line of its own by
+# clean_text_for_speech(..., breaks=True); see split_breaks().
+BREAK = "\ue002"
 
 # --- Language-dependent words ----------------------------------------------
 
@@ -66,9 +70,69 @@ _ARROW_WORDS = {"en": ("up", "down"), "fr": ("en hausse", "en baisse"),
 _SPOKEN_AS_WORD = {"AVI": "Avi"}
 _RE_SPOKEN_AS_WORD = re.compile(
     r"(?<![\w.])(" + "|".join(_SPOKEN_AS_WORD) + r")(?!\w)")
-_TABLE_WORDS = {"en": ("Table", "and"), "fr": ("Tableau", "et"),
-                "es": ("Tabla", "y"), "de": ("Tabelle", "und"),
-                "it": ("Tabella", "e")}
+# Spoken frame of a table: its size with one row and with n rows, the
+# column list, "and", and a value shared by every column ("yes for all").
+_TABLE_WORDS = {
+    "en": ("Table with 1 row.", "Table with {n} rows.", "Columns: {cols}.",
+           "and", "{v} for all"),
+    "fr": ("Tableau d'une ligne.", "Tableau de {n} lignes.",
+           "Colonnes : {cols}.", "et", "{v} pour tous"),
+    "es": ("Tabla de una fila.", "Tabla de {n} filas.", "Columnas: {cols}.",
+           "y", "{v} para todos"),
+    "de": ("Tabelle mit einer Zeile.", "Tabelle mit {n} Zeilen.",
+           "Spalten: {cols}.", "und", "{v} für alle"),
+    "it": ("Tabella di una riga.", "Tabella di {n} righe.",
+           "Colonne: {cols}.", "e", "{v} per tutti"),
+}
+# Names a numbered row whose column has no word for a header ("#")
+_ROW_WORD = {"en": "Row", "fr": "Ligne", "es": "Fila", "de": "Zeile",
+             "it": "Riga"}
+# Words a file path is spoken with: slash, dot, the home folder, backslash
+# and a Windows drive ("C drive"). Read raw, Edge says nothing or "or" for
+# "/" and turns French paths into nonsense; spelled out, both are heard.
+_PATH_WORDS = {
+    "en": ("slash", "dot", "home", "backslash", "{d} drive"),
+    "fr": ("slash", "point", "home", "antislash", "lecteur {d}"),
+    "es": ("barra", "punto", "home", "barra invertida", "unidad {d}"),
+    "de": ("Slash", "Punkt", "Home", "Backslash", "Laufwerk {d}"),
+    "it": ("slash", "punto", "home", "backslash", "unità {d}"),
+}
+# Names of symbols that are the subject of a sentence ("starts with /, ~
+# or ."), which the voice skips or the noise pass deletes.
+_SYMBOL_NAMES = {
+    "en": {"/": "slash", "\\": "backslash", "~": "tilde", ".": "dot",
+           "|": "pipe", "#": "hash", "@": "at", "*": "asterisk",
+           "&": "ampersand", "_": "underscore", "-": "hyphen", "=": "equals",
+           "+": "plus", "%": "percent", "^": "caret", "`": "backtick",
+           "<": "less than", ">": "greater than", "$": "dollar"},
+    "fr": {"/": "slash", "\\": "antislash", "~": "tilde", ".": "point",
+           "|": "pipe", "#": "dièse", "@": "arobase", "*": "astérisque",
+           "&": "esperluette", "_": "tiret bas", "-": "tiret", "=": "égal",
+           "+": "plus", "%": "pourcent", "^": "accent circonflexe",
+           "`": "accent grave", "<": "inférieur", ">": "supérieur",
+           "$": "dollar"},
+    "es": {"/": "barra", "\\": "barra invertida", "~": "virgulilla",
+           ".": "punto", "|": "barra vertical", "#": "almohadilla",
+           "@": "arroba", "*": "asterisco", "&": "et", "_": "guion bajo",
+           "-": "guion", "=": "igual", "+": "más", "%": "por ciento",
+           "^": "circunflejo", "`": "acento grave", "<": "menor que",
+           ">": "mayor que", "$": "dólar"},
+    "de": {"/": "Slash", "\\": "Backslash", "~": "Tilde", ".": "Punkt",
+           "|": "Pipe", "#": "Raute", "@": "at", "*": "Sternchen",
+           "&": "kaufmännisches Und", "_": "Unterstrich", "-": "Bindestrich",
+           "=": "gleich", "+": "plus", "%": "Prozent", "^": "Zirkumflex",
+           "`": "Backtick", "<": "kleiner als", ">": "größer als",
+           "$": "Dollar"},
+    "it": {"/": "slash", "\\": "backslash", "~": "tilde", ".": "punto",
+           "|": "pipe", "#": "cancelletto", "@": "chiocciola",
+           "*": "asterisco", "&": "e commerciale", "_": "trattino basso",
+           "-": "trattino", "=": "uguale", "+": "più", "%": "percento",
+           "^": "accento circonflesso", "`": "accento grave",
+           "<": "minore di", ">": "maggiore di", "$": "dollaro"},
+}
+# "5 * 3": multiplication between numbers
+_TIMES_WORD = {"en": "times", "fr": "fois", "es": "por", "de": "mal",
+               "it": "per"}
 _YES_NO = {"en": ("yes", "no"), "fr": ("oui", "non"), "es": ("sí", "no"),
            "de": ("ja", "nein"), "it": ("sì", "no")}
 # Mac modifier keys, named the way they are printed on the keys. Checked
@@ -300,32 +364,161 @@ def _expand_units(text, lang):
     return text.replace("", "s")
 
 
+# --- File paths ---------------------------------------------------------------
+
+# Starts a path: the start of a line, a space, or an opening quote/bracket.
+_PATH_EDGE = r"""(?<![^\s(\["'`<])"""
+_PATH_SEG = r"[\w.\-@+%]+"
+_RE_PATH = re.compile(
+    # absolute or home-relative: /etc/hosts, ~/bin/app, ./run.sh, ../x
+    _PATH_EDGE + r"(?:~|\.{1,2})?(?:/" + _PATH_SEG + r")+/?"
+    # relative: bin/app.py, src/ (kept only if it looks like a file, below)
+    + r"|" + _PATH_EDGE + _PATH_SEG + r"(?:/" + _PATH_SEG + r")+/?"
+    # Windows: C:\Users\avi\file.txt
+    + r"|" + _PATH_EDGE + r"[A-Za-z]:(?:\\" + _PATH_SEG + r")+\\?")
+# A user's home folder written out in full
+_RE_HOME = re.compile(r"^(?:/Users|/home)/[^/]+(?=/|$)")
+_RE_EXTENSION = re.compile(r"\.[A-Za-z][A-Za-z0-9]{0,5}$")
+
+
+def _speak_path(match, lang):
+    """A file path read the way a person dictates one: "~/bin/app.py" ->
+    "home slash bin slash app dot PY". Fractions and pairs that only look
+    like paths (24/7, and/or, km/h, 22/10/2026) are left to the voice,
+    which reads them well: a relative path needs a file extension or a
+    trailing slash. Extensions of up to four letters are capitalised so
+    they are spelled out: "sh" was heard as "sure", "py" as "p" in French.
+    """
+    slash, dot, home, backslash, drive = _PATH_WORDS.get(lang, _PATH_WORDS["en"])
+    path = match.group(0)
+    # A full stop or comma after the path ends the sentence
+    stripped = path.rstrip(".,;:!?")
+    tail = path[len(stripped):]
+    path = stripped
+    if not path.startswith(("/", "~", ".")) and not re.match(r"[A-Za-z]:\\", path):
+        if not (path.endswith("/") or _RE_EXTENSION.search(path)):
+            return match.group(0)
+    sep = slash
+    words = []
+    if re.match(r"[A-Za-z]:\\", path):
+        words.append(drive.format(d=path[0].upper()))
+        path, sep = path[2:], backslash
+    elif path.startswith("~") or _RE_HOME.match(path):
+        words.append(home)
+        path = path[1:] if path.startswith("~") else _RE_HOME.sub("", path)
+    parts = path.replace("\\", "/").split("/")
+    if parts and parts[-1] == "":
+        parts.pop()  # a trailing slash is not heard
+    for n, part in enumerate(parts):
+        if n or words:
+            if part or n:
+                words.append(sep)
+        if not part:
+            continue
+        name, ext = part, ""
+        found = _RE_EXTENSION.search(part)
+        if found and found.start() > 0:
+            name, ext = part[:found.start()], found.group(0)[1:]
+            ext = ext.upper() if len(ext) <= 4 else ext
+        if name in (".", ".."):
+            words.append(" ".join([dot] * len(name)))
+        else:
+            # ".config" -> "dot config", "tts_text" -> "tts text"
+            words.append(re.sub(r"\.", f" {dot} ", name).replace("_", " ").strip())
+        if ext:
+            words += [dot, ext]
+    # The leading "/" of an absolute path: parts[0] is "" there, which the
+    # loop turns into a single "slash" before the first folder.
+    # A short pause on each side keeps the path from merging with the words
+    # around it: French heard "Lance home" as "Lancôme", "app puis" "appuie".
+    return PAUSE + " ".join(w for w in words if w) + tail + PAUSE
+
+
+# --- Symbols talked about --------------------------------------------------
+
+_SYMBOL_CHARS = re.escape("".join(_SYMBOL_NAMES["en"]))
+# `/` or "~" or '.': a symbol quoted on its own is always the subject
+_RE_QUOTED_SYMBOL = re.compile(
+    r"""(`|"|'|“|‘|«\s?)([""" + _SYMBOL_CHARS + r"""]{1,3})(\s?»|`|"|'|”|’)""")
+# A lone symbol in running text: after a word and a space, or after "(",
+# so never a list "* item" or a heading "# Title", even indented.
+_LONE = r"(?:(?<=\S[ \t])|(?<=\())"
+_CONJ = r"(?:or|and|ou|et|y|o|oder|und|e)"
+# Followed by punctuation, the end of the sentence, or a conjunction
+# ("with / or ~"; "and / or", between two, is prose):
+# "starts with /, ~ or ."
+_RE_LONE_SYMBOL = re.compile(
+    _LONE + r"([" + _SYMBOL_CHARS
+    + r"])(?=[,;:)]|[.!?](?:\s|$)|[ \t]*(?:\n|$)|[ \t]+" + _CONJ + r"\b)")
+# Never prose wherever it stands alone: "~ or", "press * to mark". Not
+# before a number: "~ 3s" is "roughly 3 seconds", "5 * 3" is arithmetic.
+_RE_AFTER_CONJ = re.compile(r"\b" + _CONJ + r"[ \t]$")
+_RE_BEFORE_CONJ = re.compile(r"[ \t]+" + _CONJ + r"\b")
+_RE_LONE_NAMED = re.compile(
+    _LONE + r"([~\\^`#*])(?=[ \t]+(?![\d(-]))")
+
+
+# "5 * 3", "5*3", "(2+3) * 4": a star between numbers multiplies. Read
+# raw, the bold-marker pass deleted it and the voice said "5 3".
+_RE_TIMES = re.compile(r"(?<=[\d)])[ \t]*\*[ \t]*(?=[\d(])")
+
+
+def _name_symbols(text, lang):
+    """A symbol that is itself the subject is read by name: "starts with /,
+    ~ or ." was heard as "starts with, or" (Edge skips a lone / and ., the
+    noise pass deleted ~). Prose stays prose: "and / or", "a - b", "5 + 3"
+    are not followed by punctuation, so they are left alone."""
+    names = _SYMBOL_NAMES.get(lang, _SYMBOL_NAMES["en"])
+    times = _TIMES_WORD.get(lang, _TIMES_WORD["en"])
+    text = _RE_TIMES.sub(f" {times} ", text)
+
+    def say(chars):
+        return " ".join(names[c] for c in chars)
+    text = _RE_QUOTED_SYMBOL.sub(lambda m: say(m.group(2)), text)
+    def lone(m):
+        # "and / or" is prose: a symbol between two conjunctions
+        if (_RE_AFTER_CONJ.search(m.string, 0, m.start())
+                and _RE_BEFORE_CONJ.match(m.string, m.end())):
+            return m.group(0)
+        return say(m.group(1))
+    text = _RE_LONE_SYMBOL.sub(lone, text)
+    return _RE_LONE_NAMED.sub(lambda m: say(m.group(1)), text)
+
+
 # --- Tables -------------------------------------------------------------------
 
 def _format_table_for_speech(text, lang="en"):
-    """Detect tables and reformat them for natural narration.
+    """Detect tables and reformat them so they can be followed by ear.
 
-    Headers are read once, then each row as a short sentence. In rows of
-    three or more columns every value is announced by its column name, with
-    a colon between them: without it the voice ran "Pro 50GB" together.
-    Edge pauses ~250 ms on a colon, comma or dash and ~1 s on a full stop,
-    so the full stop is kept for the end of a row.
-      2 cols: "Table: Name and Age. Alice, 30. Bob, 25."
-      3+ cols: "Table: Feature, Free, and Pro. Storage — Free: 5GB, Pro: 50GB."
+    A listener cannot glance back at the headers, so the table is framed
+    first (its size and its columns) and every row then starts with its
+    own name, which the ear uses as an anchor:
+      "Table with 2 rows. Columns: Free, Pro, and Enterprise.
+       Storage. Free, 5GB. Pro, 50GB. Enterprise, Unlimited.
+       Support. Free, no. Pro and Enterprise, yes."
+    Grouping is carried by the pauses, measured on Edge word timings
+    (tools/tts_table_check.py): a full stop after the row name and
+    between pairs (~0.4 s), a comma inside a pair (~0.2 s). The former
+    "Free: 5GB, Pro: 50GB" paused longer inside a pair than between two,
+    so the ear heard "5GB Pro" as one unit; a semicolon between pairs
+    nearly vanished on some voices. Columns that share a value
+    are said once ("Pro and Enterprise, yes"). Two-column tables read as
+    "Alice, 30." under a "Columns: Name and Age." frame.
     """
     lines = text.split('\n')
     result = []
     i = 0
 
-    table, and_ = _TABLE_WORDS.get(lang, _TABLE_WORDS["en"])
+    one_row, n_rows, columns, and_, for_all = _TABLE_WORDS.get(
+        lang, _TABLE_WORDS["en"])
     yes, no = _YES_NO.get(lang, _YES_NO["en"])
 
-    def _header_intro(headers):
-        """Natural header list, with the Oxford comma in English only."""
-        if len(headers) == 1:
-            return headers[0]
-        last = f"{',' if lang == 'en' and len(headers) > 2 else ''} {and_} "
-        return ', '.join(headers[:-1]) + last + headers[-1]
+    def _join(items):
+        """Natural list, with the Oxford comma in English only."""
+        if len(items) == 1:
+            return items[0]
+        last = f"{',' if lang == 'en' and len(items) > 2 else ''} {and_} "
+        return ', '.join(items[:-1]) + last + items[-1]
 
     def _speak_cell(cell):
         # "✓", "❌" or "✓ (MIT)": the mark is the answer, the rest a detail
@@ -337,43 +530,70 @@ def _format_table_for_speech(text, lang="en"):
         # "-", "—", "n/a": nothing to say, so the pair is skipped
         if cell.strip("-–— ") == "" or cell.lower() in ("n/a", "na"):
             return ""
+        return cell.rstrip(_TERMINAL)
+
+    def _row_name(header, cell):
+        """A bare number names nothing by ear: "1" under "Step" is "Step 1",
+        under "#" "Row 1" (and a line starting "1." would be taken for a
+        list marker and dropped)."""
+        if re.fullmatch(r"#?\d+[.)]?", cell):
+            if not re.search(r"[^\W\d_]", header):
+                header = _ROW_WORD.get(lang, _ROW_WORD["en"])
+            return f"{header} {cell.strip('#.)')}"
         return cell
 
-    def _narrate_rows(headers, table_lines, split_fn):
-        """Convert table rows into flowing speech. A blank header (the
-        corner cell of a comparison table) keeps its column, so the names
-        stay on the right values."""
-        n_cols = len(headers)
-        named = [h for h in headers if h]
-        if not named:
-            return
-        result.append(f"{table}: {_header_intro(named)}.")
-        result.append('')
+    def _speak_pairs(pairs):
+        """(column, value) pairs as "Free, no. Pro and Enterprise, yes".
+        Neighbouring columns sharing a value are named together; columns
+        are never reordered, so a series (Q1, Q2...) keeps its order."""
+        runs = []
+        for h, v in pairs:
+            if runs and h and runs[-1][1] and runs[-1][0].lower() == v.lower():
+                runs[-1][1].append(h)
+            else:
+                runs.append((v, [h] if h else []))
+        if len(pairs) > 1 and len(runs) == 1 and runs[0][1]:
+            return for_all.format(v=pairs[0][1])
+        # A blank header names nothing: its value stands alone
+        return '. '.join(f"{_join(hs)}, {v}" if hs else v for v, hs in runs)
 
+    def _narrate_rows(headers, table_lines, split_fn):
+        """Convert table rows into speech. A blank header (the corner cell
+        of a comparison table) keeps its column, so the names stay on the
+        right values."""
+        n_cols = len(headers)
+        if not any(headers):
+            return
+        rows = []
         for row_line in table_lines:
             cells = split_fn(row_line)
             while len(cells) < n_cols:
                 cells.append('')
             cells = [_speak_cell(c) for c in cells[:n_cols]]
-
-            non_empty = [(h, c) for h, c in zip(headers, cells) if c]
-            if not non_empty:
+            if not any(cells):
                 continue
-
+            name = _row_name(headers[0], cells[0]) if cells[0] else ""
+            pairs = [(h, c) for h, c in zip(headers[1:], cells[1:]) if c]
             if n_cols <= 2:
-                # Short table: just list values, headers implied from intro
-                result.append(', '.join(c for _, c in non_empty) + '.')
+                rows.append(', '.join(c for c in (name, *[c for _, c in pairs]) if c) + '.')
+            elif not pairs:
+                rows.append(f"{name}.")
             else:
-                # Wider table: the first cell names the row, then each value
-                # follows its column name after a short pause.
-                first_val = non_empty[0][1].rstrip(_TERMINAL)
-                rest = [f"{h}: {c.rstrip(_TERMINAL)}" if h
-                        else c.rstrip(_TERMINAL) for h, c in non_empty[1:]]
-                if rest:
-                    result.append(f"{first_val} — {', '.join(rest)}.")
-                else:
-                    result.append(f"{first_val}.")
-            result.append('')
+                said = _speak_pairs(pairs)
+                said = said[:1].upper() + said[1:]  # "Yes for all", a sentence
+                rows.append(f"{name}. {said}." if name else f"{said}.")
+        if not rows:
+            return
+
+        size = one_row if len(rows) == 1 else n_rows.format(n=len(rows))
+        # In a wider table the first column holds the row names, which
+        # are heard on each row: the columns announced are the values'.
+        cols = [h for h in (headers if n_cols <= 2 else headers[1:]) if h]
+        result.append(BREAK)
+        result.append(f"{size} {columns.format(cols=_join(cols))}" if cols else size)
+        for row in rows:
+            result.extend(['', BREAK, '', row])
+        result.extend(['', BREAK, ''])
 
     while i < len(lines):
         line = lines[i].strip()
@@ -473,17 +693,29 @@ def _resolve_pauses(text):
 
 # --- Entry point ----------------------------------------------------------------
 
-def clean_text_for_speech(text, lang="en"):
+def split_breaks(text):
+    """Text cleaned with breaks=True -> the pieces to speak with a silence
+    between each (empty pieces dropped)."""
+    return [p.strip() for p in text.split(BREAK) if p.strip()]
+
+
+def clean_text_for_speech(text, lang="en", breaks=False):
     """Strip markdown/URL noise and spell out notation so TTS reads cleanly.
 
     `lang` (en, fr, es, de, it) picks the words units are spelled out with;
-    see speech_lang().
+    see speech_lang(). With `breaks`, BREAK marks where a player that can
+    insert silence should (between table rows); without, they are removed.
     """
     # ASCII arrows first: the HTML-tag pass would eat "<- a ->" as a tag.
     text = _RE_ASCII_ARROW.sub(PAUSE, text)
     # Tables — before pipe characters get turned into pauses, and before
     # symbols, so a ✓ cell can still be read as "yes"
     text = _format_table_for_speech(text, lang)
+    # File paths, before "~" and "\\" are dropped as noise and "/" left
+    # to the voice, which says nothing or "or" for it
+    text = _RE_PATH.sub(lambda m: _speak_path(m, lang), text)
+    # "starts with /, ~ or .": symbols that are the subject, by name
+    text = _name_symbols(text, lang)
     # Symbols, emoji and arrows: a pause, never silence. Dropping them
     # outright ran the surrounding words together ("System  Settings").
     text = _RE_NON_ASCII.sub(lambda m: _replace_symbol(m, lang), text)
@@ -531,4 +763,6 @@ def clean_text_for_speech(text, lang="en"):
     text = _RE_MULTI_SPACE.sub(' ', text)
     text = re.sub(r'(?m)^[ \t]+|[ \t]+$', '', text)
     text = _RE_MULTI_NEWLINE.sub('\n\n', text)
+    if not breaks:
+        text = '\n\n'.join(split_breaks(text))
     return text.strip()

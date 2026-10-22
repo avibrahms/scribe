@@ -191,6 +191,16 @@ UPGRADE_INTERVAL = 3600
 UPGRADE_TIMEOUT = 180
 
 
+# Silence written into the player between table rows (tts_text.BREAK): no
+# punctuation makes Edge pause longer than a full stop, which is also what
+# separates the pairs inside a row. Edge streams MPEG-2 layer III at 24 kHz,
+# 48 kbit/s, mono; a frame of that format with zeroed side info decodes to
+# 24 ms of silence, so the player plays it like any other audio.
+ROW_SILENCE_S = 0.7
+_SILENT_FRAME = b"\xff\xf3\x64\xc0" + bytes(140)
+ROW_SILENCE = _SILENT_FRAME * round(ROW_SILENCE_S / 0.024)
+
+
 class PlayerError(Exception):
     """The audio player failed: no endpoint can fix that."""
 
@@ -276,8 +286,9 @@ def failure_reason(exc):
     return (str(exc) or type(exc).__name__)[:160]
 
 
-async def stream_tts(text, voice, rate, pitch, volume, url):
-    """Stream TTS audio from one endpoint to the player.
+async def stream_tts(pieces, voice, rate, pitch, volume, url):
+    """Stream TTS audio of each piece from one endpoint to the player, with
+    ROW_SILENCE between pieces.
 
     Returns (error, played): the exception that stopped synthesis or None,
     and whether any audio reached the player. Once it has, starting over
@@ -291,25 +302,28 @@ async def stream_tts(text, voice, rate, pitch, volume, url):
     error = None
     player = None
     try:
-        communicate = edge_tts.Communicate(
-            text, voice, rate=rate, pitch=pitch, volume=volume,
-            connect_timeout=CONNECT_TIMEOUT)
-        # aclosing: leaving the loop early must still close the connection.
-        async with aclosing(communicate.stream()) as stream:
-            async for chunk in stream:
-                if chunk["type"] != "audio":
-                    continue
-                if player is None:
-                    # Started on the first audio, so an endpoint that refuses
-                    # never leaves an empty player complaining on stderr.
-                    try:
-                        player = subprocess.Popen(
-                            PLAYER_CMD, stdin=subprocess.PIPE)
-                    except OSError as exc:
-                        raise PlayerError(
-                            f"Can't start the audio player: {exc}")
-                player.stdin.write(chunk["data"])
-                player.stdin.flush()
+        for n, text in enumerate(pieces):
+            if n and player is not None:
+                player.stdin.write(ROW_SILENCE)
+            communicate = edge_tts.Communicate(
+                text, voice, rate=rate, pitch=pitch, volume=volume,
+                connect_timeout=CONNECT_TIMEOUT)
+            # aclosing: leaving the loop early must still close the connection.
+            async with aclosing(communicate.stream()) as stream:
+                async for chunk in stream:
+                    if chunk["type"] != "audio":
+                        continue
+                    if player is None:
+                        # Started on the first audio, so an endpoint that
+                        # refuses never leaves an empty player complaining.
+                        try:
+                            player = subprocess.Popen(
+                                PLAYER_CMD, stdin=subprocess.PIPE)
+                        except OSError as exc:
+                            raise PlayerError(
+                                f"Can't start the audio player: {exc}")
+                    player.stdin.write(chunk["data"])
+                    player.stdin.flush()
         if player is not None:
             player.stdin.close()
             if player.wait() > 0:
@@ -334,7 +348,7 @@ async def stream_tts(text, voice, rate, pitch, volume, url):
     return error, player is not None
 
 
-def speak_edge(text, voice, rate, pitch, volume):
+def speak_edge(pieces, voice, rate, pitch, volume):
     """Try each endpoint until one speaks.
 
     Returns (spoke, errors, played): errors holds every failed attempt, also
@@ -350,7 +364,7 @@ def speak_edge(text, voice, rate, pitch, volume):
     while urls:
         url = urls.pop(0)
         error, played = asyncio.run(
-            stream_tts(text, voice, rate, pitch, volume, url))
+            stream_tts(pieces, voice, rate, pitch, volume, url))
         if error is None:
             remember_endpoint(url)
             return True, errors, played
@@ -415,15 +429,20 @@ def main():
         pitch = args["pitch"] or settings["pitch"]
         volume = args["volume"] or settings.get("volume", "+0%")
 
-        text = (tts_text.clean_text_for_speech(
-                    args["text"], tts_text.speech_lang(args["text"], voice))
-                if tts_text is not None else args["text"].strip())
-        if not text:
+        if tts_text is not None:
+            pieces = tts_text.split_breaks(tts_text.clean_text_for_speech(
+                args["text"], tts_text.speech_lang(args["text"], voice),
+                breaks=True))
+        else:
+            pieces = [args["text"].strip()] if args["text"].strip() else []
+        if not pieces:
             return
+        # The Mac's own voice cannot take silences: it reads one text
+        text = "\n\n".join(pieces)
 
         try:
             spoke, errors, played = speak_edge(
-                text, voice, rate, pitch, volume)
+                pieces, voice, rate, pitch, volume)
         except (KeyboardInterrupt, SystemExit):
             return
         if spoke:
