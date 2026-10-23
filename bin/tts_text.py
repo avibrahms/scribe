@@ -9,6 +9,7 @@ words together), and a table row names each column with a pause before its
 value. Pauses are plain punctuation, the only pacing both engines honour.
 """
 import functools
+import datetime
 import re
 import unicodedata
 
@@ -364,6 +365,83 @@ def _expand_units(text, lang):
     return text.replace("", "s")
 
 
+# --- French dates and fractions ----------------------------------------------
+
+_FR_MONTHS = ("janvier", "février", "mars", "avril", "mai", "juin",
+              "juillet", "août", "septembre", "octobre", "novembre", "décembre")
+_RE_FR_DATE = re.compile(
+    r"(?<![\w/])([0-9]{1,2})/([0-9]{1,2})(?:/([0-9]{4}|[0-9]{2}))?(?![\w/])")
+_RE_FR_DATE_CONTEXT = re.compile(
+    r"\b(?:lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche|"
+    r"le|du|au|avant|après|depuis|jusqu’au|jusqu'au|date|prévu)"
+    r"\s*:?\s*$", re.IGNORECASE)
+_RE_FR_FRACTION_CONTEXT = re.compile(
+    r"\s*(?:de\b|du\b|des\b|d['’]|×|[+*=])", re.IGNORECASE)
+_RE_FR_FRACTION_PREFIX = re.compile(
+    r"\b(?:fraction|part|parts|proportion|quote-part|rapport|ratio|note|score)"
+    r"\s*:?\s*$", re.IGNORECASE)
+_RE_FR_FRACTION = re.compile(
+    r"(?<![\w/.,])([0-9]+)[ \t]*[/⁄∕][ \t]*([0-9]+)(?![\w/]|[.,][0-9])")
+_FR_DENOMINATORS = {
+    2: "demi", 3: "tiers", 4: "quart", 5: "cinquième", 6: "sixième",
+    7: "septième", 8: "huitième", 9: "neuvième", 10: "dixième",
+    11: "onzième", 12: "douzième", 13: "treizième", 14: "quatorzième",
+    15: "quinzième", 16: "seizième", 17: "dix-septième",
+    18: "dix-huitième", 19: "dix-neuvième", 20: "vingtième",
+    100: "centième", 1000: "millième",
+}
+
+
+def _expand_french_dates(text):
+    """Name the month when a slash notation is a date, not a fraction.
+
+    Short dates require a calendar cue. A quantity cue takes precedence:
+    "le 3/4 du bien" is a fraction, even though it follows "le".
+    """
+    def replace(match):
+        day, month, year = match.groups()
+        if year is None and (
+                _RE_FR_FRACTION_CONTEXT.match(text, match.end())
+                or _RE_FR_FRACTION_PREFIX.search(text[:match.start()])):
+            return match.group(0)
+        if year is None and not _RE_FR_DATE_CONTEXT.search(text[:match.start()]):
+            return match.group(0)
+        try:
+            # A leap year allows 29/02 when no year was specified.
+            check_year = int(year) if year else 2000
+            if year and len(year) == 2:
+                check_year += 2000
+            datetime.date(check_year, int(month), int(day))
+        except ValueError:
+            return match.group(0)
+        spoken_day = "premier" if int(day) == 1 else str(int(day))
+        result = f"{spoken_day} {_FR_MONTHS[int(month) - 1]}"
+        return result + (f" {check_year}" if year else "")
+    return _RE_FR_DATE.sub(replace, text)
+
+
+def _expand_french_fractions(text):
+    """Do not let the voice reinterpret remaining number pairs as dates.
+
+    Common denominators have spoken names; other ratios use the unambiguous
+    "sur" form. Three-part dates and file paths are excluded by boundaries.
+    """
+    def replace(match):
+        numerator, denominator = map(int, match.groups())
+        before = text[:match.start()]
+        if (numerator, denominator) == (24, 7):
+            return "24 heures sur 24, 7 jours sur 7"
+        if re.search(r"\b(?:note|score|rapport|ratio)\s*:?\s*$", before, re.I):
+            return f"{numerator} sur {denominator}"
+        name = _FR_DENOMINATORS.get(denominator)
+        if name is None:
+            return f"{numerator} sur {denominator}"
+        if numerator > 1 and not name.endswith("s"):
+            name += "s"
+        return f"{numerator} {name}"
+    return _RE_FR_FRACTION.sub(replace, text)
+
+
 # --- File paths ---------------------------------------------------------------
 
 # Starts a path: the start of a line, a space, or an opening quote/bracket.
@@ -384,8 +462,8 @@ _RE_EXTENSION = re.compile(r"\.[A-Za-z][A-Za-z0-9]{0,5}$")
 def _speak_path(match, lang):
     """A file path read the way a person dictates one: "~/bin/app.py" ->
     "home slash bin slash app dot PY". Fractions and pairs that only look
-    like paths (24/7, and/or, km/h, 22/10/2026) are left to the voice,
-    which reads them well: a relative path needs a file extension or a
+    like paths (24/7, and/or, km/h, 22/10/2026) are left for later text
+    preparation: a relative path needs a file extension or a
     trailing slash. Extensions of up to four letters are capitalised so
     they are spelled out: "sh" was heard as "sure", "py" as "p" in French.
     """
@@ -748,6 +826,9 @@ def clean_text_for_speech(text, lang="en", breaks=False):
     text = re.sub(r'(?<=\w)_(?=\w)', ' ', text)
     # "AVI" -> "Avi": a name, not an acronym
     text = _RE_SPOKEN_AS_WORD.sub(lambda m: _SPOKEN_AS_WORD[m.group(1)], text)
+    if lang == "fr":
+        text = _expand_french_dates(text)
+        text = _expand_french_fractions(text)
     # "3s" -> "3 seconds", "500ms" -> "500 milliseconds"
     text = _expand_units(text, lang)
     # "~5" -> "about 5"

@@ -71,6 +71,7 @@ _WORDS = {
         avait ont nos vos mon ma mes ton ta tes lui y en
         a on va vais veux veut faut fais vois sais sait allez allons suis
         sommes etes doit dois peux
+        lundi mardi mercredi jeudi vendredi samedi dimanche
     """,
     "es": """
         el la los las un una unos unas de del y en que es se no por con para
