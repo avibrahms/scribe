@@ -71,9 +71,20 @@ _ARROW_WORDS = {"en": ("up", "down"), "fr": ("en hausse", "en baisse"),
 _SPOKEN_AS_WORD = {"AVI": "Avi"}
 _RE_SPOKEN_AS_WORD = re.compile(
     r"(?<![\w.])(" + "|".join(_SPOKEN_AS_WORD) + r")(?!\w)")
-# A short acronym with a possessive is read as a word: "AI’s" was heard as
-# "Ari's". Spaced letters ("A I's") are spelled out like the bare acronym.
-_RE_ACRONYM_POSSESSIVE = re.compile(r"(?<![\w.])([A-Z]{2,3})(?=['’]s\b)")
+# A short acronym is read as a word by some voices: "AI’s" came out as
+# "Ari's" (Edge, en-AU), with or without the "’s". With dots ("A.I.’s") the
+# letters are said, without the pause a space adds. Short capitalised words
+# are left alone, as is a run of capitals (a shouted line, "WHAT WE DO").
+_CAPS_WORDS = frozenset("""
+    AM AN AS AT BE BY DO GO HE HI IF IN IS IT ME MY NO OF OH OK ON OR SO TO
+    UP US WE ADD AGE AGO ALL AND ANY ARE ART ASK BAD BIG BUT BUY CAN CAR DAY
+    DID END FAR FEW FIX FOR FUN GET GOT HAS HER HIM HIS HOT HOW ITS JOB KEY
+    LET LOW MAN MAP MAX MIN NET NEW NOT NOW OFF OLD ONE OUR OUT OWN PAY PUT
+    RED RUN SAY SEE SET SHE SIX TAX TEN THE TOO TOP TRY TWO USE WAR WAS WAY
+    WHO WHY WIN YES YET YOU
+""".split()) | frozenset(_SPOKEN_AS_WORD)
+_RE_SHORT_ACRONYM = re.compile(
+    r"(?<![\w.])(?<![A-Z] )([A-Z]{2,3})(?=s?(?![\w.])|\.(?!\w))(?! [A-Z]{2})")
 # Spoken frame of a table: its size with one row and with n rows, the
 # column list, "and", and a value shared by every column ("yes for all").
 _TABLE_WORDS = {
@@ -780,6 +791,15 @@ def split_breaks(text):
     return [p.strip() for p in text.split(BREAK) if p.strip()]
 
 
+def _dot_acronym(m):
+    word = m.group(1)
+    if word in _CAPS_WORDS:
+        return word
+    # A full stop already after it ("AI.") ends the last letter
+    end = "" if m.string.startswith(".", m.end()) else "."
+    return ".".join(word) + end
+
+
 def clean_text_for_speech(text, lang="en", breaks=False):
     """Strip markdown/URL noise and spell out notation so TTS reads cleanly.
 
@@ -829,8 +849,8 @@ def clean_text_for_speech(text, lang="en", breaks=False):
     text = re.sub(r'(?<=\w)_(?=\w)', ' ', text)
     # "AVI" -> "Avi": a name, not an acronym
     text = _RE_SPOKEN_AS_WORD.sub(lambda m: _SPOKEN_AS_WORD[m.group(1)], text)
-    # "AI’s" -> "A I’s"
-    text = _RE_ACRONYM_POSSESSIVE.sub(lambda m: " ".join(m.group(1)), text)
+    # "AI’s" -> "A.I.’s"
+    text = _RE_SHORT_ACRONYM.sub(_dot_acronym, text)
     if lang == "fr":
         text = _expand_french_dates(text)
         text = _expand_french_fractions(text)

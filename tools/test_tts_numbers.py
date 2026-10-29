@@ -35,14 +35,17 @@ class FrenchNumbersTest(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertEqual(clean_text_for_speech(source, "fr"), expected)
 
-    def test_acronym_possessive_is_spelled_out(self):
+    def test_short_acronyms_are_said_as_letters(self):
         cases = {
             "Our strategy to realize AI’s medical":
-                "Our strategy to realize A I’s medical",
-            "the CEO's plan": "the C E O's plan",
-            "AI is here": "AI is here",
+                "Our strategy to realize A.I.’s medical",
+            "AI is here": "A.I. is here",
+            "I use AI.": "I use A.I.",
+            "the CEO's plan and two APIs": "the C.E.O.'s plan and two A.P.I.s",
             "AVI's note": "Avi's note",
             "NASA's probe": "NASA's probe",
+            "do NOT stop, it is OK": "do NOT stop, it is OK",
+            "WHAT WE DO": "WHAT WE DO",
             "clip.AI's": "clip.AI's",
         }
         for source, expected in cases.items():
