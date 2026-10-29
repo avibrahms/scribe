@@ -71,6 +71,9 @@ _ARROW_WORDS = {"en": ("up", "down"), "fr": ("en hausse", "en baisse"),
 _SPOKEN_AS_WORD = {"AVI": "Avi"}
 _RE_SPOKEN_AS_WORD = re.compile(
     r"(?<![\w.])(" + "|".join(_SPOKEN_AS_WORD) + r")(?!\w)")
+# A short acronym with a possessive is read as a word: "AI’s" was heard as
+# "Ari's". Spaced letters ("A I's") are spelled out like the bare acronym.
+_RE_ACRONYM_POSSESSIVE = re.compile(r"(?<![\w.])([A-Z]{2,3})(?=['’]s\b)")
 # Spoken frame of a table: its size with one row and with n rows, the
 # column list, "and", and a value shared by every column ("yes for all").
 _TABLE_WORDS = {
@@ -826,6 +829,8 @@ def clean_text_for_speech(text, lang="en", breaks=False):
     text = re.sub(r'(?<=\w)_(?=\w)', ' ', text)
     # "AVI" -> "Avi": a name, not an acronym
     text = _RE_SPOKEN_AS_WORD.sub(lambda m: _SPOKEN_AS_WORD[m.group(1)], text)
+    # "AI’s" -> "A I’s"
+    text = _RE_ACRONYM_POSSESSIVE.sub(lambda m: " ".join(m.group(1)), text)
     if lang == "fr":
         text = _expand_french_dates(text)
         text = _expand_french_fractions(text)
