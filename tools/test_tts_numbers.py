@@ -35,6 +35,10 @@ class FrenchNumbersTest(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertEqual(clean_text_for_speech(source, "fr"), expected)
 
+    def test_french_acronyms_are_left_alone(self):
+        self.assertEqual(clean_text_for_speech("L’IA est là", "fr"),
+                         "L’IA est là")
+
     def test_short_acronyms_are_said_as_letters(self):
         cases = {
             "Our strategy to realize AI’s medical":

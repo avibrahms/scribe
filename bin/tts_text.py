@@ -849,8 +849,10 @@ def clean_text_for_speech(text, lang="en", breaks=False):
     text = re.sub(r'(?<=\w)_(?=\w)', ' ', text)
     # "AVI" -> "Avi": a name, not an acronym
     text = _RE_SPOKEN_AS_WORD.sub(lambda m: _SPOKEN_AS_WORD[m.group(1)], text)
-    # "AI’s" -> "A.I.’s"
-    text = _RE_SHORT_ACRONYM.sub(_dot_acronym, text)
+    # "AI’s" -> "A.I.’s"; French voices say "IA" as letters already, and
+    # read the dots as a pause ("I. A.")
+    if lang == "en":
+        text = _RE_SHORT_ACRONYM.sub(_dot_acronym, text)
     if lang == "fr":
         text = _expand_french_dates(text)
         text = _expand_french_fractions(text)
