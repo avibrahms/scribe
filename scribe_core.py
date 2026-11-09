@@ -149,9 +149,12 @@ DEFAULT_VOICE = "en-US-AvaMultilingualNeural"
 
 # ---------- history -------------------------------------------------------
 
-def append_history(text: str, duration_ms: int) -> None:
+def append_history(text: str, duration_ms: int,
+                   when: datetime | None = None) -> None:
+    """`when` is a UTC time; defaults to now (recovered audio passes the
+    moment it was recorded)."""
     row = {
-        "ts": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "ts": (when or datetime.utcnow()).isoformat(timespec="seconds") + "Z",
         "text": text,
         "duration_ms": duration_ms,
     }
@@ -1809,6 +1812,99 @@ def save_unsent_recording(wav_bytes: bytes) -> Path:
         except Exception:
             pass
     return path
+
+
+# Groq rejects uploads above 25 MB with "413 Payload Too Large". Recordings
+# are 48 kHz 16-bit mono (~5.5 MB a minute), so anything past ~4.5 minutes
+# fails. Whisper resamples to 16 kHz itself, so downsampling loses nothing.
+STT_MAX_UPLOAD_BYTES = 24 * 1024 * 1024
+_STT_RATE = 16000
+# Parts of at most 10 minutes at 16 kHz (~19 MB) when even that is too big.
+_STT_PART_SECONDS = 600
+
+
+def wav_upload_parts(wav_bytes: bytes) -> list[bytes]:
+    """The recording as one or more WAVs that each fit Groq's upload limit."""
+    if len(wav_bytes) <= STT_MAX_UPLOAD_BYTES:
+        return [wav_bytes]
+    with wave.open(io.BytesIO(wav_bytes), "rb") as w:
+        rate, width, chans = w.getframerate(), w.getsampwidth(), w.getnchannels()
+        raw = w.readframes(w.getnframes())
+    if width != 2:
+        raise ValueError(f"unsupported sample width {width}")
+    pcm = np.frombuffer(raw, dtype="<i2").astype(np.float32)
+    if chans > 1:
+        pcm = pcm.reshape(-1, chans).mean(axis=1)
+    if rate > _STT_RATE:
+        # Box filter as a cheap anti-alias low-pass, then resample.
+        k = int(np.ceil(rate / _STT_RATE))
+        if k > 1:
+            pcm = np.convolve(pcm, np.ones(k, dtype=np.float32) / k, "same")
+        n_out = int(len(pcm) * _STT_RATE / rate)
+        pcm = np.interp(np.arange(n_out) * (rate / _STT_RATE),
+                        np.arange(len(pcm)), pcm)
+        rate = _STT_RATE
+    pcm16 = np.clip(np.round(pcm), -32768, 32767).astype("<i2")
+    step = rate * _STT_PART_SECONDS
+    parts = []
+    for start in range(0, len(pcm16), step):
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(rate)
+            w.writeframes(pcm16[start:start + step].tobytes())
+        parts.append(buf.getvalue())
+    return parts
+
+
+def wav_duration_ms(wav_bytes: bytes) -> int:
+    with wave.open(io.BytesIO(wav_bytes), "rb") as w:
+        return int(w.getnframes() * 1000 / w.getframerate())
+
+
+RECOVERED_DIR = UNSENT_DIR / "recovered"
+
+
+def list_unsent_recordings() -> list[Path]:
+    """Saved recordings still waiting for a transcript, oldest first."""
+    if not UNSENT_DIR.exists():
+        return []
+    return sorted(UNSENT_DIR.glob("scribe-*.wav"))
+
+
+def unsent_recorded_at(path: Path) -> datetime | None:
+    """UTC time the recording was saved, read from its file name."""
+    try:
+        local = datetime.strptime(path.stem, "scribe-%Y%m%d-%H%M%S")
+    except ValueError:
+        return None
+    return datetime.utcfromtimestamp(local.timestamp())
+
+
+def transcribe_unsent(path: Path, language: str | None) -> str:
+    """Transcribe a saved recording, splitting it to fit the upload limit.
+
+    Raises TranscriptionError if any part fails, so nothing half-done is
+    treated as recovered.
+    """
+    parts = wav_upload_parts(path.read_bytes())
+    texts = [transcribe(p, language=language, raise_errors=True).strip()
+             for p in parts]
+    return " ".join(t for t in texts if t)
+
+
+def mark_recovered(path: Path) -> Path:
+    """Move a transcribed recording aside (kept, not deleted)."""
+    RECOVERED_DIR.mkdir(parents=True, exist_ok=True)
+    dest = RECOVERED_DIR / path.name
+    path.replace(dest)
+    for old in sorted(RECOVERED_DIR.glob("scribe-*.wav"))[:-20]:
+        try:
+            old.unlink()
+        except Exception:
+            pass
+    return dest
 
 
 # Whisper is famous for hallucinating these on silent / noisy clips.

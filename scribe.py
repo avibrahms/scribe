@@ -116,6 +116,11 @@ from scribe_core import (
     transcribe,
     TranscriptionError,
     save_unsent_recording,
+    list_unsent_recordings,
+    unsent_recorded_at,
+    transcribe_unsent,
+    mark_recovered,
+    wav_duration_ms,
     is_garbage,
 )
 
@@ -988,6 +993,9 @@ class ScribeApp(rumps.App):
         self.history_menu.add(
             rumps.MenuItem("Open history file", callback=self.on_open_history_file)
         )
+        self.history_menu.add(rumps.MenuItem(
+            "Recover failed recordings", callback=self.on_recover_unsent
+        ))
         self.history_menu.add(
             rumps.MenuItem("Clear history", callback=self.on_clear_history)
         )
@@ -1405,6 +1413,54 @@ class ScribeApp(rumps.App):
         if not HISTORY_FILE.exists():
             HISTORY_FILE.touch()
         subprocess.run(["open", str(HISTORY_FILE)])
+
+    def on_recover_unsent(self, _sender) -> None:
+        """Transcribe recordings saved after a failed upload, into History."""
+        if getattr(self, "_recovering", False):
+            rumps.notification("Recovery already running", "", "")
+            return
+        files = list_unsent_recordings()
+        if not files:
+            rumps.notification("Nothing to recover", "",
+                               "No failed recordings are waiting.")
+            return
+        if not groq_api_key():
+            rumps.notification("Groq key missing", "",
+                               "Set the Groq API key in the menu first.")
+            return
+        self._recovering = True
+        rumps.notification("Recovering recordings", "",
+                           f"Transcribing {len(files)} saved recording(s)…")
+        lang = None if self._lang == "auto" else self._lang
+        threading.Thread(target=self._recover_unsent, args=(files, lang),
+                         daemon=True).start()
+
+    def _recover_unsent(self, files, lang) -> None:
+        done, failed = 0, []
+        try:
+            for path in files:
+                try:
+                    wav = path.read_bytes()
+                    text = _apply_voice_tokens(
+                        transcribe_unsent(path, lang)).strip()
+                    if text and not is_garbage(text):
+                        append_history(text, wav_duration_ms(wav),
+                                       unsent_recorded_at(path))
+                    mark_recovered(path)
+                    done += 1
+                except Exception as exc:
+                    print(f"[recover] {path.name}: {exc}", file=sys.stderr)
+                    failed.append(path.name)
+        finally:
+            self._recovering = False
+        msg = f"{done} recording(s) transcribed into History."
+        if failed:
+            msg += f" {len(failed)} still failing, kept for later."
+
+        def ui() -> None:
+            self._refresh_history_menu()
+            rumps.notification("Recovery finished", "", msg)
+        callAfter(ui)
 
     def on_clear_history(self, _sender) -> None:
         with _foreground_app():
