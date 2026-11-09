@@ -725,6 +725,12 @@ class ScribeApp(rumps.App):
         self._rec_events: "queue.Queue[bool]" = queue.Queue()
         threading.Thread(target=self._rec_event_loop, daemon=True).start()
 
+        # Background retry of recordings saved when transcription failed.
+        self._recover_lock = threading.Lock()
+        self._recover_fails: dict[str, int] = {}
+        self._recover_next: dict[str, float] = {}
+        threading.Thread(target=self._auto_recover_loop, daemon=True).start()
+
         # Build the audio capture child now, while the user is nowhere near
         # the hotkey, so the first press doesn't pay for a Python start-up
         # plus Pa_Initialize.
@@ -1416,9 +1422,6 @@ class ScribeApp(rumps.App):
 
     def on_recover_unsent(self, _sender) -> None:
         """Transcribe recordings saved after a failed upload, into History."""
-        if getattr(self, "_recovering", False):
-            rumps.notification("Recovery already running", "", "")
-            return
         files = list_unsent_recordings()
         if not files:
             rumps.notification("Nothing to recover", "",
@@ -1428,15 +1431,37 @@ class ScribeApp(rumps.App):
             rumps.notification("Groq key missing", "",
                                "Set the Groq API key in the menu first.")
             return
-        self._recovering = True
+        if not self._recover_lock.acquire(blocking=False):
+            rumps.notification("Recovery already running", "", "")
+            return
         rumps.notification("Recovering recordings", "",
                            f"Transcribing {len(files)} saved recording(s)…")
-        lang = None if self._lang == "auto" else self._lang
-        threading.Thread(target=self._recover_unsent, args=(files, lang),
+        threading.Thread(target=self._recover_unsent, args=(files, False),
                          daemon=True).start()
 
-    def _recover_unsent(self, files, lang) -> None:
+    # Saved recordings (network was down) are retried in the background:
+    # every 2 minutes at first, backing off to every 30 minutes per file.
+    _AUTO_RECOVER_TICK = 120
+    _AUTO_RECOVER_MAX_WAIT = 1800
+
+    def _auto_recover_loop(self) -> None:
+        while True:
+            time.sleep(self._AUTO_RECOVER_TICK)
+            try:
+                if self.recording or not groq_api_key():
+                    continue
+                now = time.monotonic()
+                files = [f for f in list_unsent_recordings()
+                         if self._recover_next.get(f.name, 0) <= now]
+                if files and self._recover_lock.acquire(blocking=False):
+                    self._recover_unsent(files, True)
+            except Exception as exc:
+                print(f"[recover] auto: {exc}", file=sys.stderr)
+
+    def _recover_unsent(self, files, auto: bool) -> None:
+        """Caller holds self._recover_lock; released here."""
         done, failed = 0, []
+        lang = None if self._lang == "auto" else self._lang
         try:
             for path in files:
                 try:
@@ -1447,19 +1472,29 @@ class ScribeApp(rumps.App):
                         append_history(text, wav_duration_ms(wav),
                                        unsent_recorded_at(path))
                     mark_recovered(path)
+                    self._recover_fails.pop(path.name, None)
+                    self._recover_next.pop(path.name, None)
                     done += 1
                 except Exception as exc:
                     print(f"[recover] {path.name}: {exc}", file=sys.stderr)
                     failed.append(path.name)
+                    n = self._recover_fails.get(path.name, 0) + 1
+                    self._recover_fails[path.name] = n
+                    wait = min(self._AUTO_RECOVER_TICK * 2 ** (n - 1),
+                               self._AUTO_RECOVER_MAX_WAIT)
+                    self._recover_next[path.name] = time.monotonic() + wait
         finally:
-            self._recovering = False
+            self._recover_lock.release()
+        if auto and not done:
+            return   # still offline: stay quiet, try again later
         msg = f"{done} recording(s) transcribed into History."
         if failed:
-            msg += f" {len(failed)} still failing, kept for later."
+            msg += f" {len(failed)} still failing, will retry."
+        title = "Saved recording transcribed" if auto else "Recovery finished"
 
         def ui() -> None:
             self._refresh_history_menu()
-            rumps.notification("Recovery finished", "", msg)
+            rumps.notification(title, "", msg)
         callAfter(ui)
 
     def on_clear_history(self, _sender) -> None:
@@ -2133,7 +2168,8 @@ class ScribeApp(rumps.App):
                 status = "⚠ Transcription failed — audio saved"
                 rumps.notification(
                     "Scribe couldn't transcribe", "Recording saved",
-                    f"{str(exc)[:80]}\n{saved}",
+                    "It will be transcribed automatically once the "
+                    f"connection is back.\n{str(exc)[:80]}",
                 )
                 return
             # Turn spoken "slash/dash/underscore/etc." into literal chars
