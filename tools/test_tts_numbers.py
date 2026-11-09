@@ -46,7 +46,7 @@ class FrenchNumbersTest(unittest.TestCase):
             "AI is here": "A.I. is here",
             "I use AI.": "I use A.I.",
             "the CEO's plan and two APIs": "the C.E.O.'s plan and two A.P.I.s",
-            "AVI's note": "Avi's note",
+            "AVI's note": "Ahvee's note",
             "NASA's probe": "NASA's probe",
             "do NOT stop, it is OK": "do NOT stop, it is OK",
             "WHAT WE DO": "WHAT WE DO",

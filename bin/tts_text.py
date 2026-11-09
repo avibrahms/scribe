@@ -71,6 +71,11 @@ _ARROW_WORDS = {"en": ("up", "down"), "fr": ("en hausse", "en baisse"),
 _SPOKEN_AS_WORD = {"AVI": "Avi"}
 _RE_SPOKEN_AS_WORD = re.compile(
     r"(?<![\w.])(" + "|".join(_SPOKEN_AS_WORD) + r")(?!\w)")
+# English voices spell "Avi" as letters too ("A V I"); written the way it
+# sounds, the name is said. Other voices already say "Avi" right.
+_SPOKEN_AS_WORD_EN = {"Avi": "Ahvee"}
+_RE_SPOKEN_AS_WORD_EN = re.compile(
+    r"(?<![\w.])(" + "|".join(_SPOKEN_AS_WORD_EN) + r")(?!\w)")
 # A short acronym is read as a word by some voices: "AI’s" came out as
 # "Ari's" (Edge, en-AU), with or without the "’s". With dots ("A.I.’s") the
 # letters are said, without the pause a space adds. Short capitalised words
@@ -849,6 +854,9 @@ def clean_text_for_speech(text, lang="en", breaks=False):
     text = re.sub(r'(?<=\w)_(?=\w)', ' ', text)
     # "AVI" -> "Avi": a name, not an acronym
     text = _RE_SPOKEN_AS_WORD.sub(lambda m: _SPOKEN_AS_WORD[m.group(1)], text)
+    if lang == "en":
+        text = _RE_SPOKEN_AS_WORD_EN.sub(
+            lambda m: _SPOKEN_AS_WORD_EN[m.group(1)], text)
     # "AI’s" -> "A.I.’s"; French voices say "IA" as letters already, and
     # read the dots as a pause ("I. A.")
     if lang == "en":
