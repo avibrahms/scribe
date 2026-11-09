@@ -1742,7 +1742,23 @@ def correct_dictation_terms(text: str) -> str:
 def transcribe(wav_bytes: bytes, language: str | None = "en",
                raise_errors: bool = False) -> str:
     """
-    Transcribe WAV bytes with Groq Whisper.
+    Transcribe WAV bytes with Groq Whisper, of any length.
+
+    Long recordings are downsampled and, if still too big for Groq's upload
+    limit, sent in parts whose transcripts are joined. With `raise_errors`,
+    any failed part raises, so the caller keeps the whole recording.
+    """
+    if not groq_api_key() or not wav_bytes:
+        return ""
+    texts = [_transcribe_one(p, language, raise_errors).strip()
+             for p in wav_upload_parts(wav_bytes)]
+    return " ".join(t for t in texts if t)
+
+
+def _transcribe_one(wav_bytes: bytes, language: str | None,
+                    raise_errors: bool) -> str:
+    """
+    Transcribe one upload-sized WAV with Groq Whisper.
 
     Returns "" for no key, no audio, or no speech. A request that fails
     (after retrying transient network errors) also returns "" unless
@@ -1820,6 +1836,7 @@ def save_unsent_recording(wav_bytes: bytes) -> Path:
 STT_MAX_UPLOAD_BYTES = 24 * 1024 * 1024
 _STT_RATE = 16000
 # Parts of at most 10 minutes at 16 kHz (~19 MB) when even that is too big.
+# Any length works: a 30-minute dictation goes up as three parts.
 _STT_PART_SECONDS = 600
 
 
@@ -1845,16 +1862,32 @@ def wav_upload_parts(wav_bytes: bytes) -> list[bytes]:
                         np.arange(len(pcm)), pcm)
         rate = _STT_RATE
     pcm16 = np.clip(np.round(pcm), -32768, 32767).astype("<i2")
-    step = rate * _STT_PART_SECONDS
     parts = []
-    for start in range(0, len(pcm16), step):
+    for seg in _split_at_pauses(pcm16, rate):
         buf = io.BytesIO()
         with wave.open(buf, "wb") as w:
             w.setnchannels(1)
             w.setsampwidth(2)
             w.setframerate(rate)
-            w.writeframes(pcm16[start:start + step].tobytes())
+            w.writeframes(seg.tobytes())
         parts.append(buf.getvalue())
+    return parts
+
+
+def _split_at_pauses(pcm16, rate: int) -> list:
+    """Cut into parts of at most _STT_PART_SECONDS, each cut placed at the
+    quietest 100 ms of the 30 s before the limit, so words aren't split."""
+    limit, search, win = rate * _STT_PART_SECONDS, rate * 30, rate // 10
+    parts, start = [], 0
+    while len(pcm16) - start > limit:
+        lo = start + limit - search
+        zone = pcm16[lo:start + limit].astype(np.float32) ** 2
+        n = len(zone) // win
+        energy = zone[:n * win].reshape(n, win).mean(axis=1)
+        cut = lo + int(np.argmin(energy)) * win + win // 2
+        parts.append(pcm16[start:cut])
+        start = cut
+    parts.append(pcm16[start:])
     return parts
 
 
@@ -1888,10 +1921,8 @@ def transcribe_unsent(path: Path, language: str | None) -> str:
     Raises TranscriptionError if any part fails, so nothing half-done is
     treated as recovered.
     """
-    parts = wav_upload_parts(path.read_bytes())
-    texts = [transcribe(p, language=language, raise_errors=True).strip()
-             for p in parts]
-    return " ".join(t for t in texts if t)
+    return transcribe(path.read_bytes(), language=language,
+                      raise_errors=True).strip()
 
 
 def mark_recovered(path: Path) -> Path:
