@@ -16,20 +16,17 @@ The API key is read from $OPENAI_API_KEY, or from
 import json
 import os
 import re
-import signal
 import subprocess
 import sys
-import time
 import urllib.request
 import urllib.error
 
-CONFIG_DIR = os.path.expanduser("~/.config/speak-selection")
+# Shared with edge-tts-stream, deployed alongside: only one read runs at a
+# time, and `edge-tts-stream --stop` (and Scribe's stop) kills ours too.
+from tts_proc import CONFIG_DIR, claim, release, stop_existing
+
 SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
-CONFIG_FILE = os.path.join(CONFIG_DIR, "config")
 KEY_FILE = os.path.join(CONFIG_DIR, "openai_key")
-# Same pid file as edge-tts-stream: only one playback runs at a time, and this
-# lets `edge-tts-stream --stop` (and Scribe's stop) kill us by process group.
-PID_FILE = os.path.join(CONFIG_DIR, "speak.pid")
 
 PLAYER_CMD = ["/opt/homebrew/bin/play", "-t", "mp3", "-q", "-"]
 
@@ -51,37 +48,6 @@ DEFAULT_INSTRUCTIONS = (
 # first chunk small so audio starts quickly, then use larger chunks.
 FIRST_CHUNK_CHARS = 700
 MAX_CHUNK_CHARS = 3200
-
-
-def stop_existing():
-    """Kill any currently running speech process group. SIGTERM first,
-    escalate to SIGKILL if the group survives."""
-    try:
-        with open(PID_FILE) as f:
-            pgid = int(f.read().strip())
-    except (OSError, ValueError):
-        return
-    if pgid != os.getpgrp():
-        try:
-            os.killpg(pgid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
-            pass
-        else:
-            for _ in range(10):
-                time.sleep(0.05)
-                try:
-                    os.killpg(pgid, 0)
-                except (ProcessLookupError, PermissionError):
-                    break
-            else:
-                try:
-                    os.killpg(pgid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
-    try:
-        os.unlink(PID_FILE)
-    except OSError:
-        pass
 
 
 def parse_args():
@@ -356,15 +322,7 @@ def main():
         return
 
     stop_existing()
-
-    try:
-        os.setpgrp()
-    except OSError:
-        pass
-
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-    with open(PID_FILE, "w") as f:
-        f.write(str(os.getpgid(0)))
+    claim()
 
     try:
         if args["stdin"]:
@@ -409,12 +367,7 @@ def main():
         hand_off_to_edge(unread, reason)
         return 1
     finally:
-        try:
-            with open(PID_FILE) as f:
-                if int(f.read().strip()) == os.getpgid(0):
-                    os.unlink(PID_FILE)
-        except (OSError, ValueError):
-            pass
+        release()
 
 
 if __name__ == "__main__":

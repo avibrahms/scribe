@@ -4,10 +4,10 @@ Scribe — macOS menubar app for voice in and voice out.
 
 Two things in one:
 
-  • TTS  — free Microsoft Edge voices via the `edge-tts` package. A voice
-           picker writes the selection to ~/.config/speak-selection/config
-           so any external "speak selection" hotkey you already use keeps
-           working with no extra setup.
+  • TTS  — free Microsoft Edge voices via the `edge-tts` package, or
+           OpenAI's. The menu's choices are mirrored in
+           ~/.config/speak-selection/settings.json, which the read-aloud
+           helpers in ~/bin (and so the ⌃D / ⌃X hotkeys) read.
 
   • STT  — hold a modifier key to record. Pick which key from the
            "Dictation Hotkey" menu (Right ⌥ Option, Fn/🌐 Globe, etc).
@@ -60,7 +60,6 @@ from scribe_core import (
     HISTORY_FILE,
     CONFIG_FILE,
     SPEAK_SELECTION_DIR,
-    VOICE_CONFIG_FILE,
     SETTINGS_FILE,
     VOICES,
     DEFAULT_VOICE,
@@ -167,6 +166,15 @@ _load_dotenv(DOTENV_FILE)
 
 EDGE_TTS_STREAM = Path.home() / "bin" / "edge-tts-stream"
 OPENAI_TTS_STREAM = Path.home() / "bin" / "openai-tts-stream"
+# Written by whichever helper is reading, removed when it ends.
+TTS_PID_FILE = Path.home() / ".config" / "speak-selection" / "speak.pid"
+# Every process a read can leave behind, as one pattern for one pkill.
+_TTS_STRAY_PATTERN = "|".join((
+    "edge-tts-stream --(stdin|text)",
+    "openai-tts-stream --(stdin|text)",
+    "/opt/homebrew/bin/play -t mp3",
+    "scribe-say-",  # the Mac-voice fallback's text file (tts_fallback)
+))
 
 # Both helpers explain a failed synthesis in one "[…-tts] reason" stderr line.
 _RE_TTS_HELPER_ERROR = re.compile(r"^\[(?:edge|openai)-tts\] (.+)$", re.M)
@@ -304,6 +312,10 @@ def copy_to_pasteboard(text: str) -> None:
 def post_cmd_v() -> None:
     """Send ⌘V so whatever has focus receives a paste."""
     post_cmd_key(9)
+
+
+# Longest wait for the frontmost app to answer ⌘C.
+_COPY_WAIT_S = 0.6
 
 
 def post_cmd_c() -> None:
@@ -1661,15 +1673,19 @@ class ScribeApp(rumps.App):
         snapshot = _snapshot_pasteboard()
         pb = NSPasteboard.generalPasteboard()
         before_change = int(pb.changeCount())
-        before_text = _pasteboard_text()
         text = ""
         try:
             post_cmd_c()
-            time.sleep(0.15)
-            after_change = int(pb.changeCount())
-            copied = _pasteboard_text().strip()
-            if copied and (after_change != before_change or copied != before_text.strip()):
-                text = copied
+            # Wait for the copy itself: most apps answer within a few
+            # milliseconds, a slow one may need half a second. Some clear
+            # the pasteboard first and fill it a moment later.
+            deadline = time.monotonic() + _COPY_WAIT_S
+            while time.monotonic() < deadline:
+                if int(pb.changeCount()) != before_change:
+                    text = _pasteboard_text().strip()
+                    if text:
+                        break
+                time.sleep(0.01)
         finally:
             try:
                 _restore_pasteboard(snapshot)
@@ -1693,9 +1709,9 @@ class ScribeApp(rumps.App):
         self._speak_text(text)
 
     def _speak_text(self, text: str) -> None:
-        # Pick the backend by the persisted engine choice. OpenAI is the
-        # default; Edge is the free fallback. If OpenAI is selected but the
-        # key is missing, fall back to Edge so Read aloud still works.
+        # Pick the backend by the persisted engine choice. If OpenAI is
+        # selected but the key is missing, Edge reads instead, so Read aloud
+        # still works.
         use_openai = self.tts_engine == "openai"
         if use_openai and not openai_api_key():
             callAfter(lambda: rumps.notification(
@@ -1806,13 +1822,14 @@ class ScribeApp(rumps.App):
         print(f"[tts] {name} failed: {reason}", file=sys.stderr)
         callAfter(lambda: rumps.notification("Read aloud failed", name, reason))
 
-    def _kill_tts_proc(self) -> None:
-        """Kill the playback child we spawned, hard. Safe to call anytime."""
+    def _kill_tts_proc(self) -> bool:
+        """Kill the playback child we spawned, hard. Safe to call anytime.
+        True when there was one to kill."""
         with self._tts_lock:
             proc = self._tts_proc
             self._tts_proc = None
         if proc is None or proc.poll() is not None:
-            return
+            return False
         # Spawned with start_new_session=True, so pgid == proc.pid and the
         # group is guaranteed not to be ours.
         try:
@@ -1830,51 +1847,50 @@ class ScribeApp(rumps.App):
                 proc.wait(timeout=0.5)
             except subprocess.TimeoutExpired:
                 pass
+        return True
 
     def _stop_reading(self) -> None:
+        # ⌃S reaches this from every app, mostly while nothing is being
+        # read: each step first looks whether there is anything for it to
+        # stop, and only a Stop that stopped something says so.
         # Three independent kill paths — any one alone silences playback,
         # so the Stop button works even when the others are broken.
         # 1. The child we spawned: direct group kill, no PID-file involved.
-        self._kill_tts_proc()
+        stopped = self._kill_tts_proc()
         # 2. The helpers' shared PID file — catches speech started by anything
-        #    other than this app. Both helpers write the same pid file, so
-        #    either --stop kills the active playback group; call whichever
-        #    exists.
-        for helper in (EDGE_TTS_STREAM, OPENAI_TTS_STREAM):
-            if not helper.exists():
-                continue
-            try:
-                subprocess.run(
-                    [str(helper), "--stop"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=2,
-                    check=False,
-                )
-            except Exception as exc:
-                print(f"[tts] --stop failed: {exc}", file=sys.stderr)
+        #    other than this app. Both helpers write the same file, so one
+        #    --stop kills the active playback group, whichever engine it is.
+        if TTS_PID_FILE.exists():
+            for helper in (EDGE_TTS_STREAM, OPENAI_TTS_STREAM):
+                if not helper.exists():
+                    continue
+                stopped = True
+                try:
+                    subprocess.run(
+                        [str(helper), "--stop"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=2,
+                        check=False,
+                    )
+                except Exception as exc:
+                    print(f"[tts] --stop failed: {exc}", file=sys.stderr)
+                break
         # 3. Last resort: sweep stray TTS processes by command line. The
-        #    patterns include the mode flag so the --stop helper above can
-        #    never match itself.
-        for pattern in (
-            "edge-tts-stream --stdin",
-            "edge-tts-stream --text",
-            "openai-tts-stream --stdin",
-            "openai-tts-stream --text",
-            "/opt/homebrew/bin/play -t mp3",
-            "scribe-say-",  # the Mac-voice fallback's text file (tts_fallback)
-        ):
-            try:
-                subprocess.run(
-                    ["pkill", "-9", "-f", pattern],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=2,
-                    check=False,
-                )
-            except Exception:
-                pass
-        callAfter(lambda: rumps.notification("Reading stopped", "", ""))
+        #    patterns include the mode flag so a --stop helper can never
+        #    match, and pkill never matches itself.
+        try:
+            swept = subprocess.run(
+                ["pkill", "-9", "-f", _TTS_STRAY_PATTERN],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+                check=False,
+            ).returncode == 0
+        except Exception:
+            swept = False
+        if stopped or swept:
+            callAfter(lambda: rumps.notification("Reading stopped", "", ""))
 
     def on_test_voice(self, _sender) -> None:
         threading.Thread(target=self._speak_test, daemon=True).start()

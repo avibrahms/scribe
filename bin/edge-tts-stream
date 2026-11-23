@@ -6,61 +6,38 @@ Uses process groups and a PID file for clean stop from any source.
 """
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 
-CONFIG_DIR = os.path.expanduser("~/.config/speak-selection")
+# Shared with openai-tts-stream, deployed alongside: only one read runs at a
+# time, whichever helper started it.
+from tts_proc import CONFIG_DIR, claim, release, stop_existing
+
+if __name__ == "__main__" and "--stop" in sys.argv[1:]:
+    # Before anything else is loaded: a Stop should cost as little as it can.
+    stop_existing()
+    sys.exit(0)
+
 SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
-CONFIG_FILE = os.path.join(CONFIG_DIR, "config")
-PID_FILE = os.path.join(CONFIG_DIR, "speak.pid")
 
 PLAYER_CMD = ["/opt/homebrew/bin/play", "-t", "mp3", "-q", "-"]
 
 
-def stop_existing():
-    """Kill any currently running speech process group. SIGTERM first,
-    escalate to SIGKILL if the group survives."""
-    try:
-        with open(PID_FILE) as f:
-            pgid = int(f.read().strip())
-    except (OSError, ValueError):
-        return
-    # Never kill our own group: a stale/corrupt PID file pointing at the
-    # caller's group would otherwise take down the menubar app itself.
-    if pgid != os.getpgrp():
-        try:
-            os.killpg(pgid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
-            pass
-        else:
-            for _ in range(10):
-                time.sleep(0.05)
-                try:
-                    os.killpg(pgid, 0)
-                except (ProcessLookupError, PermissionError):
-                    break
-            else:
-                try:
-                    os.killpg(pgid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
-    try:
-        os.unlink(PID_FILE)
-    except OSError:
-        pass
-
-
 def parse_args():
     """Fast arg parsing without argparse."""
-    args = {"stop": False, "text": None, "stdin": False, "voice": None,
-            "rate": None, "pitch": None, "volume": None}
+    args = {"stop": False, "standby": False, "text": None, "stdin": False,
+            "voice": None, "rate": None, "pitch": None, "volume": None}
     i = 1
     while i < len(sys.argv):
         a = sys.argv[i]
         if a == "--stop":
             args["stop"] = True
+        elif a == "--standby":
+            args["standby"] = True
         elif a == "--stdin":
             args["stdin"] = True
         elif a == "--text" and i + 1 < len(sys.argv):
@@ -92,27 +69,31 @@ def parse_args():
     return args
 
 
-# Shared language detector, deployed next to this script. Optional on
-# purpose: if it is missing we simply speak with the configured voice, which
-# is what this helper did before per-language voices existed.
-try:
-    import tts_lang
-except Exception:
-    tts_lang = None
+# Shared helpers deployed next to this script, loaded by load_tools() once a
+# read needs them. Each is optional on purpose:
+#   tts_lang      language detector; without it the configured voice speaks,
+#                 which is what this helper did before per-language voices;
+#   tts_fallback  the Mac's own voice and notifications; without it a failure
+#                 is reported instead of worked around;
+#   tts_text      text preparation (markdown, tables, symbols, units); without
+#                 it the text is read as written.
+tts_lang = tts_fallback = tts_text = None
 
-# Shared fallbacks (the Mac's own voice, notifications), deployed alongside.
-# Optional too: without it a failure is reported instead of worked around.
-try:
-    import tts_fallback
-except Exception:
-    tts_fallback = None
 
-# Shared text preparation (markdown, tables, symbols, units), deployed
-# alongside. Optional too: without it the text is read as written.
-try:
-    import tts_text
-except Exception:
-    tts_text = None
+def load_tools():
+    global tts_lang, tts_fallback, tts_text
+    try:
+        import tts_lang
+    except Exception:
+        tts_lang = None
+    try:
+        import tts_fallback
+    except Exception:
+        tts_fallback = None
+    try:
+        import tts_text
+    except Exception:
+        tts_text = None
 
 
 def auto_voice(text, settings, explicit):
@@ -136,30 +117,16 @@ def auto_voice(text, settings, explicit):
 
 
 def load_settings():
-    """Load voice/rate/pitch/volume from config."""
+    """Voice, rate, pitch and volume as Scribe last saved them."""
     settings = {"voice": "en-US-BrianNeural", "rate": "+0%",
                 "pitch": "+0Hz", "volume": "+0%",
                 "edge_voice_by_lang": {}, "edge_lang_defaults": {},
                 "tts_autodetect": True}
-    if os.path.exists(SETTINGS_FILE):
-        try:
-            with open(SETTINGS_FILE) as f:
-                settings.update(json.load(f))
-        except Exception:
-            pass
-    elif os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE) as f:
-                for line in f:
-                    line = line.strip()
-                    if "=" in line and not line.startswith("#"):
-                        key, val = line.split("=", 1)
-                        key = key.strip().lower()
-                        val = val.strip().strip('"').strip("'")
-                        if key in settings:
-                            settings[key] = val
-        except Exception:
-            pass
+    try:
+        with open(SETTINGS_FILE) as f:
+            settings.update(json.load(f))
+    except Exception:
+        pass
     return settings
 
 
@@ -188,7 +155,9 @@ CONNECT_TIMEOUT = 5
 # check an hour rather than one per read.
 UPGRADE_STAMP = os.path.join(CONFIG_DIR, "edge-tts-upgrade.stamp")
 UPGRADE_INTERVAL = 3600
-UPGRADE_TIMEOUT = 180
+# Longest a read with no voice yet waits for the upgrade (it usually takes a
+# few seconds). Past that the Mac's voice reads it, and pip finishes alone.
+UPGRADE_WAIT = 30
 
 
 # Silence written into the player between table rows (tts_text.BREAK): no
@@ -203,6 +172,265 @@ ROW_SILENCE = _SILENT_FRAME * round(ROW_SILENCE_S / 0.024)
 
 class PlayerError(Exception):
     """The audio player failed: no endpoint can fix that."""
+
+
+# How the text reaches the ear. Measured in November 2026: about one
+# connection in thirty to Microsoft lands on a slow server. It sends its first
+# audio after 5 to 10 seconds instead of 1, then slower than the voice speaks,
+# while a connection opened at the same moment is fast. Audio piped straight
+# from one connection into the player therefore stopped in the middle of
+# words. So:
+#   1. the text is cut into units of whole sentences, each fetched on its own
+#      connection, a few of them ahead of the voice;
+#   2. a unit reaches the player only once all of it has arrived, so the voice
+#      can pause between two sentences but never inside a word;
+#   3. a connection that is slow to start or to finish is raced by a fresh
+#      one, and the first to deliver the whole unit wins.
+
+# Characters per unit: the first is short so the voice starts quickly.
+UNIT_CHARS = (150, 300, 450)
+LONG_SENTENCE = 600        # a sentence beyond this is cut at a comma or space
+PARALLEL = 2               # units fetched at the same time
+LOOKAHEAD_S = 120          # audio fetched ahead of the voice, at most
+CHARS_PER_S = 14           # rough reading speed, to estimate a unit's length
+AUDIO_BYTES_PER_S = 6000   # Edge's 48 kbit/s
+
+# A healthy connection sends its first audio within about 1 second and the
+# rest of a unit within 1 more.
+SLOW_FIRST_S = 1.8
+SLOW_REST_S = 2.0
+# Microsoft refuses a client that opens many connections at once (eight reads
+# started together in a test were all refused), so both numbers stay small:
+# four connections at the very most.
+RACERS = 2                 # connections working on one unit, at most
+# Failed connections a unit survives once the voice has started: stopping
+# mid-read is worse than a pause. Before that, one per endpoint and one more
+# (Microsoft's 429 Too Many Requests is often momentary), so a dead service
+# hands over to the next voice quickly.
+PATIENT_TRIES = 6
+RECEIVE_TIMEOUT = 20
+
+_RE_SENTENCE_END = re.compile(r'[.!?…。！？]+["\'”’»)\]]*\s+|\n+')
+# A full stop that ends an abbreviation or an initial, not a sentence.
+_RE_ABBREVIATION = re.compile(
+    r'(?:\b[A-Za-z]|\b(?:Mr|Mrs|Ms|Dr|Prof|St|vs|etc|No|cf|Fig|approx|Mme'
+    r'|Mlle|e\.g|i\.e))\.["\'”’»)\]]*\s+$')
+_RE_SPEAKABLE = re.compile(r'\w')
+
+
+def sentences(text):
+    """Cut text where a voice would end a sentence, keeping every character."""
+    out = []
+    start = 0
+    for m in _RE_SENTENCE_END.finditer(text):
+        end = m.end()
+        if end >= len(text):
+            break
+        if "\n" not in m.group() and (
+                text[end].islower()
+                or _RE_ABBREVIATION.search(text, start, end)):
+            continue
+        out.append(text[start:end])
+        start = end
+    out.append(text[start:])
+    cut = []
+    for part in out:
+        while len(part) > LONG_SENTENCE:
+            head = part[:UNIT_CHARS[-1]]
+            at = max(head.rfind(", "), head.rfind("; "), head.rfind(": "))
+            if at < 0:
+                at = head.rfind(" ")
+            at = at + 1 if at >= 0 else len(head)
+            cut.append(part[:at])
+            part = part[at:]
+        cut.append(part)
+    return cut
+
+
+def split_units(text):
+    """Group whole sentences into units, each with something to say."""
+    units = []
+    buf = ""
+    for part in sentences(text):
+        limit = UNIT_CHARS[min(len(units), len(UNIT_CHARS) - 1)]
+        if (len(buf) + len(part) > limit and _RE_SPEAKABLE.search(buf)
+                and _RE_SPEAKABLE.search(part)):
+            units.append(buf.strip())
+            buf = ""
+        buf += part
+    if _RE_SPEAKABLE.search(buf):
+        units.append(buf.strip())
+    return units
+
+
+class Playback:
+    """The audio player, fed whole units by its own thread, so fetching
+    never waits on playing."""
+
+    def __init__(self):
+        self.cond = threading.Condition()
+        self.queue = []       # whole units the player has not been given yet
+        self.fed = False
+        self.done = False     # everything has been fed
+        self.aborted = False
+        self.error = None     # PlayerError raised in the thread
+        self.player = None
+        self.thread = None
+        self.dry_at = 0.0     # when the audio the player has runs out
+        self.first_sound = None
+        self.gaps = []        # seconds the player sat with nothing to play
+
+    @property
+    def started(self):
+        """Whether any audio reached the player."""
+        return self.player is not None
+
+    def ahead(self):
+        """Seconds of audio fed but not played yet."""
+        with self.cond:
+            queued = sum(len(data) for data in self.queue)
+        return (max(0.0, self.dry_at - time.monotonic())
+                + queued / AUDIO_BYTES_PER_S)
+
+    def feed(self, data):
+        """Hand over a whole unit: a pause after it is fine."""
+        with self.cond:
+            if self.error is not None:
+                raise self.error
+            self.queue.append(data)
+            self.fed = True
+            self.cond.notify()
+        if self.thread is None:
+            self.thread = threading.Thread(target=self._run, daemon=True)
+            self.thread.start()
+
+    def finish(self):
+        """Play out everything fed; raises PlayerError if the player failed."""
+        with self.cond:
+            self.done = True
+            self.cond.notify()
+        if self.thread is not None:
+            self.thread.join()
+        if self.error is not None:
+            raise self.error
+
+    def close(self):
+        """Stop at once: whatever is still waiting or playing is dropped."""
+        with self.cond:
+            self.aborted = True
+            self.cond.notify()
+        if self.thread is not None:
+            # Until the thread is gone it may still be starting the player.
+            while self.thread.is_alive():
+                self._kill_player()
+                self.thread.join(0.05)
+        self._kill_player()
+
+    def _kill_player(self):
+        if self.player is not None and self.player.poll() is None:
+            self.player.kill()
+            self.player.wait()
+            try:
+                self.player.stdin.close()   # drops what it never took
+            except OSError:
+                pass
+
+    def _next(self):
+        with self.cond:
+            while not (self.queue or self.done or self.aborted):
+                self.cond.wait()
+            if self.aborted or not self.queue:
+                return None
+            data = b"".join(self.queue)
+            self.queue.clear()
+            return data
+
+    def _run(self):
+        try:
+            while True:
+                data = self._next()
+                if data is None:
+                    break
+                now = time.monotonic()
+                if self.player is None:
+                    # Started on the first audio, so a service that refuses
+                    # never leaves an empty player complaining.
+                    try:
+                        self.player = subprocess.Popen(
+                            PLAYER_CMD, stdin=subprocess.PIPE)
+                    except OSError as exc:
+                        raise PlayerError(
+                            f"Can't start the audio player: {exc}")
+                    self.first_sound = time.time()
+                elif now - self.dry_at > 0.15:
+                    self.gaps.append(round(now - self.dry_at, 1))
+                self.dry_at = (max(self.dry_at, now)
+                               + len(data) / AUDIO_BYTES_PER_S)
+                self.player.stdin.write(data)
+                self.player.stdin.flush()
+            if self.player is not None and not self.aborted:
+                self.player.stdin.close()
+                if self.player.wait() > 0:
+                    raise PlayerError("The audio player failed "
+                                      f"(exit {self.player.returncode}).")
+        except PlayerError as exc:
+            self._fail(exc)
+        except (BrokenPipeError, ValueError):
+            # Killed by a signal = a Stop, which takes us down with it anyway.
+            if not self.aborted and self.player.wait() > 0:
+                self._fail(PlayerError("The audio player quit unexpectedly."))
+        except Exception as exc:
+            self._fail(PlayerError(f"The audio player failed: {exc}"))
+
+    def _fail(self, exc):
+        with self.cond:
+            self.error = exc
+
+
+# One line per read in LOG_FILE: when a pause is heard, it says whether the
+# service, the network or the player was behind it.
+LOG_FILE = os.path.join(CONFIG_DIR, "read-aloud.log")
+LOG_MAX_BYTES = 200_000
+STARTED = time.time()     # when this process, or the one it reads for, began
+_read = None    # the read in progress: what its log line is built from
+
+
+def write_log(outcome):
+    """Append the line of the read in progress, once."""
+    global _read
+    read, _read = _read, None
+    if read is None:
+        return
+    playback = read["playback"]
+    first = playback.first_sound
+    line = (f"{time.strftime('%Y-%m-%d %H:%M:%S')} {outcome}"
+            f"{' standby' if SERVING else ''}"
+            f" chars={read['chars']} units={read['units']}"
+            f" first_sound={'-' if first is None else f'{first - STARTED:.2f}s'}"
+            f" took={time.time() - STARTED:.1f}s"
+            f" raced={read['raced']} errors={len(read['errors'])}"
+            f" pauses={playback.gaps} voice={read['voice']}\n")
+    try:
+        if os.path.getsize(LOG_FILE) > LOG_MAX_BYTES:
+            with open(LOG_FILE, "rb") as f:
+                f.seek(-LOG_MAX_BYTES // 2, os.SEEK_END)
+                tail = f.read().split(b"\n", 1)[-1]
+            with open(LOG_FILE, "wb") as f:
+                f.write(tail)
+    except OSError:
+        pass
+    try:
+        with open(LOG_FILE, "a") as f:
+            f.write(line)
+    except OSError:
+        pass
+
+
+def _on_stop(signum, frame):
+    """A Stop: note it, then die of the signal as before."""
+    write_log("stopped")
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
 
 
 def endpoints():
@@ -248,9 +476,10 @@ def edge_tts_version():
         return None
 
 
-def upgrade_edge_tts():
+def upgrade_edge_tts(wait=UPGRADE_WAIT):
     """Install the newest edge-tts into this interpreter's environment.
-    Returns True when a different version is now installed."""
+    Returns True when a different version is installed within `wait` seconds;
+    with wait=0 the upgrade is only started."""
     try:
         if time.time() - os.path.getmtime(UPGRADE_STAMP) < UPGRADE_INTERVAL:
             return False
@@ -268,7 +497,9 @@ def upgrade_edge_tts():
              "--disable-pip-version-check", "--upgrade", "edge-tts"],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, start_new_session=True)
-        pip.wait(timeout=UPGRADE_TIMEOUT)
+        if not wait:
+            return False
+        pip.wait(timeout=wait)
     except (OSError, subprocess.TimeoutExpired):
         return False
     return edge_tts_version() != before
@@ -286,97 +517,153 @@ def failure_reason(exc):
     return (str(exc) or type(exc).__name__)[:160]
 
 
-async def stream_tts(pieces, voice, rate, pitch, volume, url):
-    """Stream TTS audio of each piece from one endpoint to the player, with
-    ROW_SILENCE between pieces.
-
-    Returns (error, played): the exception that stopped synthesis or None,
-    and whether any audio reached the player. Once it has, starting over
-    elsewhere would read the beginning twice.
-    """
+async def fetch_once(text, voice, rate, pitch, volume, urls, read, attempt):
+    """The whole audio of one unit over one connection."""
     from contextlib import aclosing
     import edge_tts
     import edge_tts.communicate as comm
-    comm.WSS_URL = url
-
-    error = None
-    player = None
+    at = read["url"]
+    comm.WSS_URL = urls[at % len(urls)]
+    audio = bytearray()
     try:
-        for n, text in enumerate(pieces):
-            if n and player is not None:
-                player.stdin.write(ROW_SILENCE)
-            communicate = edge_tts.Communicate(
-                text, voice, rate=rate, pitch=pitch, volume=volume,
-                connect_timeout=CONNECT_TIMEOUT)
-            # aclosing: leaving the loop early must still close the connection.
-            async with aclosing(communicate.stream()) as stream:
-                async for chunk in stream:
-                    if chunk["type"] != "audio":
-                        continue
-                    if player is None:
-                        # Started on the first audio, so an endpoint that
-                        # refuses never leaves an empty player complaining.
-                        try:
-                            player = subprocess.Popen(
-                                PLAYER_CMD, stdin=subprocess.PIPE)
-                        except OSError as exc:
-                            raise PlayerError(
-                                f"Can't start the audio player: {exc}")
-                    player.stdin.write(chunk["data"])
-                    player.stdin.flush()
-        if player is not None:
-            player.stdin.close()
-            if player.wait() > 0:
-                raise PlayerError(
-                    f"The audio player failed (exit {player.returncode}).")
-    except BrokenPipeError:
-        # Killed by a signal = a Stop, which takes us down with it anyway.
-        if player.wait() > 0:
-            error = PlayerError("The audio player quit unexpectedly.")
+        communicate = edge_tts.Communicate(
+            text, voice, rate=rate, pitch=pitch, volume=volume,
+            connect_timeout=CONNECT_TIMEOUT, receive_timeout=RECEIVE_TIMEOUT)
+        # aclosing: being cancelled must still close the connection.
+        async with aclosing(communicate.stream()) as stream:
+            async for chunk in stream:
+                if chunk["type"] == "audio":
+                    if attempt["first"] is None:
+                        attempt["first"] = time.monotonic()
+                    audio += chunk["data"]
+    except Exception:
+        # The next connection goes to the next endpoint.
+        if read["url"] == at:
+            read["url"] = at + 1
+        raise
+    read["good_url"] = urls[at % len(urls)]
+    return bytes(audio)
+
+
+def is_slow(attempt):
+    now = time.monotonic()
+    if attempt["first"] is None:
+        return now - attempt["start"] > SLOW_FIRST_S
+    return now - attempt["first"] > SLOW_REST_S
+
+
+async def fetch_unit(text, voice, rate, pitch, volume, urls, read):
+    """The whole audio of one unit, racing a slow connection with a fresh
+    one and replacing a failed one, a little later each time."""
+    import asyncio
+    racers = {}   # task -> attempt
+    failures = 0
+
+    def connect():
+        attempt = {"start": time.monotonic(), "first": None}
+        racers[asyncio.create_task(fetch_once(
+            text, voice, rate, pitch, volume, urls, read, attempt))] = attempt
+
+    connect()
+    try:
+        while True:
+            done, _ = await asyncio.wait(
+                racers, timeout=0.2, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                del racers[task]
+                if task.exception() is None:
+                    return task.result()
+                read["errors"].append(task.exception())
+                failures += 1
+                if failures > (PATIENT_TRIES if read["playback"].started
+                               else len(urls)):
+                    raise task.exception()
+            if not racers:
+                if failures > 1:
+                    await asyncio.sleep(min(2.0, 0.5 * (failures - 1)))
+                connect()
+            elif len(racers) < RACERS and all(map(is_slow, racers.values())):
+                read["raced"] += 1
+                connect()
+    finally:
+        for task in racers:
+            task.cancel()
+        await asyncio.gather(*racers, return_exceptions=True)
+
+
+async def read_aloud(pieces, voice, rate, pitch, volume, urls, read):
+    """Fetch every unit and play them in order, with ROW_SILENCE between
+    pieces. Returns the exception that stopped the read, or None."""
+    import asyncio
+    playback = read["playback"]
+    units = []    # (text, first of a later piece)
+    for n, piece in enumerate(pieces):
+        for k, text in enumerate(split_units(piece)):
+            units.append((text, bool(n) and k == 0))
+    read["units"] = len(units)
+    tasks = {}    # unit number -> its fetch
+    launched = 0
+    error = None
+    try:
+        for n, (_, new_piece) in enumerate(units):
+            while not tasks[n].done() if n in tasks else True:
+                fetching = sum(len(units[i][0]) for i in tasks) / CHARS_PER_S
+                while (launched < len(units) and len(tasks) < PARALLEL
+                       and (launched == n or playback.ahead() + fetching
+                            < LOOKAHEAD_S)):
+                    tasks[launched] = asyncio.create_task(fetch_unit(
+                        units[launched][0], voice, rate, pitch, volume,
+                        urls, read))
+                    fetching += len(units[launched][0]) / CHARS_PER_S
+                    launched += 1
+                await asyncio.wait([tasks[n]], timeout=1.0)
+            audio = tasks.pop(n).result()
+            if new_piece and playback.fed:
+                audio = ROW_SILENCE + audio
+            playback.feed(audio)
+        # Off the event loop: it must not sit blocked for the whole read.
+        await asyncio.get_running_loop().run_in_executor(
+            None, playback.finish)
     except Exception as exc:
         error = exc
     finally:
-        if player is not None:
-            try:
-                if player.stdin and not player.stdin.closed:
-                    player.stdin.close()
-            except Exception:
-                pass
-            if player.poll() is None:
-                player.kill()
-                player.wait()
-    return error, player is not None
+        for task in tasks.values():
+            task.cancel()
+        await asyncio.gather(*tasks.values(), return_exceptions=True)
+        playback.close()
+    return error
 
 
 def speak_edge(pieces, voice, rate, pitch, volume):
-    """Try each endpoint until one speaks.
+    """Read the pieces aloud.
 
-    Returns (spoke, errors, played): errors holds every failed attempt, also
-    the ones before an endpoint that worked.
+    Returns (spoke, errors, played): errors holds every failed connection,
+    also the ones another connection made up for; played, whether any audio
+    reached the player. Once it has, another voice would start over.
     """
+    global _read
     import asyncio
     try:
         urls = endpoints()
     except ImportError as exc:
         return False, [exc], False
-    errors = []
-    rate_limited = set()
-    while urls:
-        url = urls.pop(0)
-        error, played = asyncio.run(
-            stream_tts(pieces, voice, rate, pitch, volume, url))
-        if error is None:
-            remember_endpoint(url)
-            return True, errors, played
+    playback = Playback()
+    read = {"playback": playback, "url": 0, "good_url": None, "errors": [],
+            "raced": 0, "units": 0, "voice": voice,
+            "chars": sum(map(len, pieces))}
+    _read = read
+    error = asyncio.run(
+        read_aloud(pieces, voice, rate, pitch, volume, urls, read))
+    errors = read["errors"]
+    if error is None:
+        write_log("ok")
+        if read["good_url"]:
+            remember_endpoint(read["good_url"])
+        return True, errors, playback.started
+    if not errors or errors[-1] is not error:
         errors.append(error)
-        if played or isinstance(error, PlayerError):
-            return False, errors, played
-        # 429 Too Many Requests is often momentary (Microsoft throttles
-        # clients it is phasing out): one more try once the others are done.
-        if getattr(error, "status", None) == 429 and url not in rate_limited:
-            rate_limited.add(url)
-            urls.append(url)
-    return False, errors, False
+    write_log(f"failed({failure_reason(error)[:60]})")
+    return False, errors, playback.started
 
 
 def worth_upgrading(errors):
@@ -391,6 +678,220 @@ def voice_locale(voice):
     return "-".join(voice.split("-")[:2])
 
 
+def read_text(text, args):
+    """Read the text aloud. Returns (status, played): status 1 when nothing
+    could read it (reason on stderr), None when Edge could not start and
+    `args["edge_only"]` leaves the other voices to the caller."""
+    load_tools()
+    # Load settings, CLI args take priority
+    settings = load_settings()
+    voice = auto_voice(text, settings, args["voice"])
+    rate = args["rate"] or settings["rate"]
+    pitch = args["pitch"] or settings["pitch"]
+    volume = args["volume"] or settings.get("volume", "+0%")
+
+    if tts_text is not None:
+        pieces = tts_text.split_breaks(tts_text.clean_text_for_speech(
+            text, tts_text.speech_lang(text, voice), breaks=True))
+    else:
+        pieces = [text.strip()] if text.strip() else []
+    if not pieces:
+        return 0
+
+    spoke, errors, played = speak_edge(pieces, voice, rate, pitch, volume)
+    if spoke:
+        # A refusal on the way there means this edge-tts is falling
+        # behind Microsoft: start its update, without waiting on it.
+        if worth_upgrading(errors):
+            upgrade_edge_tts(wait=0)
+        return 0
+    if not played and args.get("edge_only"):
+        return None
+    if (tts_fallback is not None and not played
+            and worth_upgrading(errors) and upgrade_edge_tts()):
+        # A fresh process, so the upgraded edge-tts is the one imported.
+        tts_fallback.exec_with_stdin(
+            [sys.executable, os.path.abspath(__file__), "--stdin",
+             "--voice", voice, "--rate", rate, "--pitch", pitch,
+             "--volume", volume],
+            text)
+    reason = failure_reason(errors[-1])
+    # Scribe and speak-selection.sh show this line to the user when
+    # nothing else speaks either, so a dead service is never silent.
+    print(f"[edge-tts] {reason}", file=sys.stderr)
+    if played and not isinstance(errors[-1], PlayerError):
+        return 1  # cut off mid-read: another voice would start it over
+    if tts_fallback is None:
+        return 1
+    tts_fallback.notify("Read aloud: using the Mac's voice",
+                        f"Microsoft Edge failed: {reason}")
+    # The Mac's own voice cannot take silences: it reads one text
+    if tts_fallback.speak_with_system_voice(
+            "\n\n".join(pieces), voice_locale(voice)):
+        return 0
+    print(f"[edge-tts] {reason} The Mac's own voice failed too.",
+          file=sys.stderr)
+    return 1
+
+
+# The standby. Loading edge-tts takes this helper 0.2 s, a fifth of the wait
+# for the first word. So each read leaves behind one process that has it
+# loaded already and waits for the next read on a socket; that read's own
+# process only passes it the text and waits. A standby reads once, and is
+# replaced by a fresh one that has the current code and settings. Nobody
+# reading for STANDBY_IDLE_S: it exits, and the next read loads edge-tts
+# itself, as before.
+STANDBY_SOCKET = os.path.join(CONFIG_DIR, "standby.sock")
+STANDBY_LOCK = os.path.join(CONFIG_DIR, "standby.lock")
+STANDBY_IDLE_S = 600
+STANDBY_SPAWN_AFTER_S = 2.0   # once this read's own loading is done
+SERVING = False               # whether this process is a standby at work
+ME = os.path.abspath(__file__)
+
+
+def my_version():
+    """Changes whenever this file does: a standby from before an update must
+    not read with the old code."""
+    try:
+        return os.path.getmtime(ME)
+    except OSError:
+        return 0
+
+
+def spawn_standby():
+    try:
+        subprocess.Popen(
+            [sys.executable, ME, "--standby"], stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+    except OSError:
+        pass
+
+
+def spawn_standby_later():
+    timer = threading.Timer(STANDBY_SPAWN_AFTER_S, spawn_standby)
+    timer.daemon = True
+    timer.start()
+
+
+def _receive(sock):
+    """One message: its length on 10 digits, then JSON."""
+    def exactly(n):
+        data = b""
+        while len(data) < n:
+            block = sock.recv(n - len(data))
+            if not block:
+                raise OSError("closed")
+            data += block
+        return data
+    return json.loads(exactly(int(exactly(10))))
+
+
+def _send(sock, message):
+    data = json.dumps(message).encode()
+    sock.sendall(b"%010d" % len(data) + data)
+
+
+def ask_standby(text, args):
+    """Have the standby read the text. Returns its exit status, or None when
+    there is no standby or it could not start: then we read it ourselves."""
+    import socket
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(0.3)
+        sock.connect(STANDBY_SOCKET)
+        _send(sock, {"text": text, "args": args, "started": STARTED,
+                     "version": my_version()})
+        # Our being killed (a Stop) closes the socket, which stops the standby.
+        sock.settimeout(None)
+        answer = _receive(sock)
+    except (OSError, ValueError):
+        return None
+    finally:
+        sock.close()
+    if answer.get("stderr"):
+        sys.stderr.write(answer["stderr"])
+    return answer.get("status")
+
+
+def standby():
+    """Load everything, wait for one read, do it."""
+    global STARTED, SERVING
+    import asyncio  # noqa: F401  (loaded now, so the read does not wait on it)
+    import fcntl
+    import io
+    import socket
+    import edge_tts  # noqa: F401
+    load_tools()
+    version = my_version()
+
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    lock = open(STANDBY_LOCK, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return 0  # there is a standby already
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        os.unlink(STANDBY_SOCKET)
+    except OSError:
+        pass
+    try:
+        server.bind(STANDBY_SOCKET)
+        server.listen(1)
+        server.settimeout(STANDBY_IDLE_S)
+        conn, _ = server.accept()
+    except OSError:
+        conn = None
+    # Whatever happens next, the place is free for the next standby.
+    server.close()
+    try:
+        os.unlink(STANDBY_SOCKET)
+    except OSError:
+        pass
+    lock.close()
+    if conn is None:
+        return 0
+
+    try:
+        conn.settimeout(5)
+        job = _receive(conn)
+        conn.settimeout(None)
+    except (OSError, ValueError):
+        return 0
+    if job.get("version") != version or version != my_version():
+        _send(conn, {"status": None})
+        return 0
+    spawn_standby_later()
+    STARTED = job["started"]
+    SERVING = True
+
+    def stop_with_the_asker():
+        # Nothing more is sent to us: the socket closing means the process
+        # that asked is gone, killed by a Stop or a newer read.
+        try:
+            conn.recv(1)
+        except OSError:
+            pass
+        write_log("stopped")
+        # Our group: us, the player, the Mac's voice if it took over. The
+        # next standby has its own.
+        os.killpg(os.getpgrp(), signal.SIGKILL)
+
+    threading.Thread(target=stop_with_the_asker, daemon=True).start()
+    stderr, sys.stderr = sys.stderr, io.StringIO()
+    try:
+        status = read_text(job["text"], dict(job["args"], edge_only=True))
+    except Exception as exc:
+        status = None
+        print(f"[edge-tts] standby: {exc}", file=stderr)
+    try:
+        _send(conn, {"status": status, "stderr": sys.stderr.getvalue()})
+    except OSError:
+        pass
+    return 0
+
+
 def main():
     """Exit status: 1 when nothing could read the text (reason on stderr),
     else 0."""
@@ -399,91 +900,29 @@ def main():
     if args["stop"]:
         stop_existing()
         return
+    if args["standby"]:
+        return standby()
 
     # Stop any existing speech first
     stop_existing()
-
-    # New process group so one signal kills us + play child. Must happen
-    # BEFORE reading stdin: a process wedged in stdin.read() with no PID
-    # file registered is unstoppable from the outside.
-    try:
-        os.setpgrp()
-    except OSError:
-        pass  # already a group/session leader (spawned with start_new_session)
-
-    # Write PID file
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-    with open(PID_FILE, "w") as f:
-        f.write(str(os.getpgid(0)))
+    claim()
+    signal.signal(signal.SIGTERM, _on_stop)
 
     try:
-        if args["stdin"]:
-            args["text"] = sys.stdin.read()
-        if not args["text"]:
+        text = sys.stdin.read() if args["stdin"] else args["text"]
+        if not text:
             return
-
-        # Load settings, CLI args take priority
-        settings = load_settings()
-        voice = auto_voice(args["text"], settings, args["voice"])
-        rate = args["rate"] or settings["rate"]
-        pitch = args["pitch"] or settings["pitch"]
-        volume = args["volume"] or settings.get("volume", "+0%")
-
-        if tts_text is not None:
-            pieces = tts_text.split_breaks(tts_text.clean_text_for_speech(
-                args["text"], tts_text.speech_lang(args["text"], voice),
-                breaks=True))
-        else:
-            pieces = [args["text"].strip()] if args["text"].strip() else []
-        if not pieces:
-            return
-        # The Mac's own voice cannot take silences: it reads one text
-        text = "\n\n".join(pieces)
-
+        options = {k: args[k] for k in ("voice", "rate", "pitch", "volume")}
         try:
-            spoke, errors, played = speak_edge(
-                pieces, voice, rate, pitch, volume)
+            status = ask_standby(text, options)
+            if status is None:
+                spawn_standby_later()
+                status = read_text(text, options)
         except (KeyboardInterrupt, SystemExit):
             return
-        if spoke:
-            # A refusal on the way there means this edge-tts is falling
-            # behind Microsoft: update it now, while nobody waits on it.
-            if worth_upgrading(errors):
-                upgrade_edge_tts()
-            return
-        if (tts_fallback is not None and not played
-                and worth_upgrading(errors) and upgrade_edge_tts()):
-            # A fresh process, so the upgraded edge-tts is the one imported.
-            tts_fallback.exec_with_stdin(
-                [sys.executable, os.path.abspath(__file__), "--stdin",
-                 "--voice", voice, "--rate", rate, "--pitch", pitch,
-                 "--volume", volume],
-                args["text"])
-        reason = failure_reason(errors[-1])
-        # Scribe and speak-selection.sh show this line to the user when
-        # nothing else speaks either, so a dead service is never silent.
-        print(f"[edge-tts] {reason}", file=sys.stderr)
-        if played and not isinstance(errors[-1], PlayerError):
-            return 1  # cut off mid-read: another voice would start it over
-        if tts_fallback is None:
-            return 1
-        tts_fallback.notify("Read aloud: using the Mac's voice",
-                            f"Microsoft Edge failed: {reason}")
-        if tts_fallback.speak_with_system_voice(text, voice_locale(voice)):
-            return 0
-        print(f"[edge-tts] {reason} The Mac's own voice failed too.",
-              file=sys.stderr)
-        return 1
+        return status
     finally:
-        # Only remove the PID file if it still points at us — a newer
-        # speak process may have replaced it, and deleting that entry
-        # would make the new playback unstoppable.
-        try:
-            with open(PID_FILE) as f:
-                if int(f.read().strip()) == os.getpgid(0):
-                    os.unlink(PID_FILE)
-        except (OSError, ValueError):
-            pass
+        release()
 
 
 if __name__ == "__main__":

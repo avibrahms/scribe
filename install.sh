@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # Scribe installer.
 #
-# Does six things:
+# Does seven things:
 #   1. Creates a local venv and pip-installs dependencies.
 #   2. Asks for your Groq API key (if not already set) and writes .env.
 #   3. Builds a signed Scribe.app bundle via py2app.
 #   4. Installs the bundle at ~/Applications/Scribe.app.
 #   5. Installs a LaunchAgent that auto-starts Scribe at login + restarts on exit.
-#   6. Opens the three macOS permission panes you need to grant (once).
+#   6. Installs the read-aloud helpers and Quick Actions (install-read-aloud.sh).
+#   7. Opens the three macOS permission panes you need to grant (once).
 #
 # Run from inside the cloned repo:
 #     ./install.sh
@@ -117,7 +118,11 @@ PLIST
 launchctl bootout "gui/$(id -u)/com.avi.scribe" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$LAUNCH_AGENT"
 
-# --- 6. permissions -----------------------------------------------------
+# --- 6. read aloud ------------------------------------------------------
+
+"$REPO_DIR/install-read-aloud.sh"
+
+# --- 7. permissions -----------------------------------------------------
 
 cat <<'EOF'
 

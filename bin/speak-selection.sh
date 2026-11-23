@@ -3,7 +3,8 @@
 #
 # Reads the active engine from ~/.config/speak-selection/settings.json
 # ("engine": "openai" | "edge") so the global hotkey matches whatever you
-# picked in the Scribe menu. Falls back to Edge if OpenAI is unavailable.
+# picked in the Scribe menu. Edge, the free one, speaks unless OpenAI was
+# picked there, and whenever OpenAI is unavailable.
 #
 # Triggered via the "Speak Selection" Quick Action (⌃D) and the clipboard
 # one (⌃X). Accepts the text as $1, on stdin (--stdin), or from the clipboard.
@@ -13,14 +14,14 @@ KEY_FILE="$HOME/.config/speak-selection/openai_key"
 EDGE="$HOME/bin/edge-tts-stream"
 OPENAI="$HOME/bin/openai-tts-stream"
 
-# --- pick engine (default openai) -----------------------------------------
-ENGINE="openai"
+# --- pick engine (default edge) -------------------------------------------
+ENGINE="edge"
 if [ -f "$SETTINGS" ]; then
     E=$(sed -n 's/.*"engine"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$SETTINGS" | head -1)
     [ -n "$E" ] && ENGINE="$E"
 fi
 
-if [ "$ENGINE" = "edge" ]; then
+if [ "$ENGINE" != "openai" ]; then
     HELPER="$EDGE"
 else
     HELPER="$OPENAI"

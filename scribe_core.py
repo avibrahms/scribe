@@ -292,57 +292,38 @@ def save_groq_key_to_dotenv(key: str) -> None:
         pass
 
 
-# ---------- TTS voice config (shared with macOS speak-selection) ---------
+# ---------- Edge TTS voice ------------------------------------------------
+# Kept in config.json like every other setting, and mirrored for the helpers
+# in settings.json (_write_speak_settings).
 
-def _parse_shell_kv(text: str) -> dict[str, str]:
-    """Shell-style KEY=\"VALUE\" parser."""
-    out: dict[str, str] = {}
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, _, v = line.partition("=")
-        v = v.strip()
-        if (v.startswith('"') and v.endswith('"')) or (
-            v.startswith("'") and v.endswith("'")
-        ):
-            v = v[1:-1]
-        out[k.strip()] = v
-    return out
+def _legacy_voice() -> str:
+    """The voice in VOICE_CONFIG_FILE, where Scribe kept it (as VOICE="…")
+    before it moved to config.json."""
+    try:
+        for line in VOICE_CONFIG_FILE.read_text().splitlines():
+            key, _, value = line.strip().partition("=")
+            if key.strip() == "VOICE":
+                return value.strip().strip("\"'")
+    except Exception:
+        pass
+    return ""
 
 
 def load_voice() -> str:
-    try:
-        if VOICE_CONFIG_FILE.exists():
-            raw = VOICE_CONFIG_FILE.read_text()
-            kv = _parse_shell_kv(raw)
-            v = kv.get("VOICE") or raw.strip()
-            return v or DEFAULT_VOICE
-    except Exception:
-        pass
-    return DEFAULT_VOICE
+    return (str(load_cfg().get("edge_voice") or "").strip()
+            or _legacy_voice() or DEFAULT_VOICE)
 
 
 def save_voice(voice: str) -> None:
-    """Write shell-sourceable config alongside a JSON mirror."""
-    kv: dict[str, str] = {"RATE": "+0%", "PITCH": "+0Hz"}
-    if VOICE_CONFIG_FILE.exists():
-        try:
-            kv.update(_parse_shell_kv(VOICE_CONFIG_FILE.read_text()))
-        except Exception:
-            pass
-    kv["VOICE"] = voice
-    out = "\n".join(f'{k}="{v}"' for k, v in kv.items()) + "\n"
-    VOICE_CONFIG_FILE.write_text(out)
-
-    settings = {}
-    if SETTINGS_FILE.exists():
-        try:
-            settings = json.loads(SETTINGS_FILE.read_text())
-        except Exception:
-            settings = {}
-    settings["voice"] = voice
-    SETTINGS_FILE.write_text(json.dumps(settings, indent=2))
+    cfg = load_cfg()
+    cfg["edge_voice"] = voice
+    save_cfg(cfg)
+    _write_speak_settings(voice=voice)
+    # config.json has it now: the old copy must not be found again.
+    try:
+        VOICE_CONFIG_FILE.unlink()
+    except OSError:
+        pass
 
 
 # ---------- TTS engine selection (Edge vs OpenAI) ------------------------
@@ -351,7 +332,7 @@ def save_voice(voice: str) -> None:
 #   • "openai" — gpt-4o-mini-tts, natural + steerable emotion (needs a key)
 
 TTS_ENGINES = ("openai", "edge")
-DEFAULT_TTS_ENGINE = "openai"
+DEFAULT_TTS_ENGINE = "edge"
 
 OPENAI_TTS_MODEL = "gpt-4o-mini-tts"
 DEFAULT_OPENAI_VOICE = "coral"
@@ -507,8 +488,7 @@ def load_edge_volume() -> str:
 def save_edge_prosody(*, rate: str | None = None,
                       pitch: str | None = None,
                       volume: str | None = None) -> None:
-    """Persist Edge prosody to cfg, the JSON mirror (primary source for the
-    standalone helper) and the shell-sourceable config (external-hotkey parity)."""
+    """Persist Edge prosody to cfg and to the helpers' mirror."""
     cfg = load_cfg()
     if rate is not None:
         cfg["edge_rate"] = rate
@@ -527,7 +507,6 @@ def save_edge_prosody(*, rate: str | None = None,
         mirror["volume"] = volume
     if mirror:
         _write_speak_settings(**mirror)
-    _update_shell_config(RATE=rate, PITCH=pitch, VOLUME=volume)
 
 
 # ---------- per-language TTS voices --------------------------------------
@@ -703,6 +682,8 @@ def sync_speak_settings() -> None:
     different voice than the menu displays. Called at startup so the two
     stores cannot silently drift apart.
     """
+    if not load_cfg().get("edge_voice"):
+        save_voice(load_voice())  # from where it was kept before config.json
     _write_speak_settings(
         engine=load_tts_engine(),
         voice=load_voice(),
@@ -732,33 +713,9 @@ def resolve_tts_voice(engine: str, text: str) -> tuple[str, str | None]:
     return effective_tts_voice(engine, lang), lang
 
 
-def _update_shell_config(**kv) -> None:
-    """Merge KEY="value" pairs into the shell-sourceable VOICE_CONFIG_FILE,
-    preserving any keys already there."""
-    existing = {
-        "VOICE": load_voice(),
-        "RATE": DEFAULT_EDGE_RATE,
-        "PITCH": DEFAULT_EDGE_PITCH,
-        "VOLUME": DEFAULT_EDGE_VOLUME,
-    }
-    if VOICE_CONFIG_FILE.exists():
-        try:
-            existing.update(_parse_shell_kv(VOICE_CONFIG_FILE.read_text()))
-        except Exception:
-            pass
-    for k, v in kv.items():
-        if v is not None:
-            existing[k] = v
-    out = "\n".join(f'{k}="{v}"' for k, v in existing.items()) + "\n"
-    try:
-        VOICE_CONFIG_FILE.write_text(out)
-    except Exception:
-        pass
-
-
 def _write_speak_settings(**fields) -> None:
-    """Mirror OpenAI TTS prefs into the speak-selection settings.json so the
-    standalone `openai-tts-stream` helper (and any external hotkey) sees them."""
+    """Mirror TTS settings into the speak-selection settings.json, the only
+    place the standalone helpers (and so the hotkeys) read them from."""
     settings = {}
     if SETTINGS_FILE.exists():
         try:

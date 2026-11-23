@@ -107,7 +107,8 @@ def check_rows(voice, helper):
 
 def check_deployed():
     ok = True
-    for name in ("tts_text.py", "edge-tts-stream", "openai-tts-stream"):
+    for name in ("tts_text.py", "tts_lang.py", "tts_proc.py", "tts_fallback.py",
+                 "edge-tts-stream", "openai-tts-stream", "speak-selection.sh"):
         deployed = os.path.join(DEPLOYED_BIN, name)
         if os.path.exists(deployed) and not filecmp.cmp(
                 os.path.join(REPO_BIN, name), deployed, shallow=False):
