@@ -65,6 +65,9 @@ _APPROX_WORD = {"en": "roughly", "fr": "environ", "es": "unos",
 _ARROW_WORDS = {"en": ("up", "down"), "fr": ("en hausse", "en baisse"),
                 "es": ("sube", "baja"), "de": ("hoch", "runter"),
                 "it": ("su", "giù")}
+# The three fixes below answer how the Edge voices say short words; they are
+# applied for Edge only (see `engine` in clean_text_for_speech).
+#
 # Words written in capitals that are spoken as one word, not spelled out
 # letter by letter ("A V I"), in every language. Not after a dot, so a
 # file extension (clip.AVI) is left alone.
@@ -873,12 +876,15 @@ def _dot_acronym(m):
     return ".".join(word) + end
 
 
-def clean_text_for_speech(text, lang="en", breaks=False):
+def clean_text_for_speech(text, lang="en", breaks=False, engine="edge"):
     """Strip markdown/URL noise and spell out notation so TTS reads cleanly.
 
     `lang` (en, fr, es, de, it) picks the words units are spelled out with;
     see speech_lang(). With `breaks`, BREAK marks where a player that can
     insert silence should (between table rows); without, they are removed.
+    `engine` is the one that will speak: the respellings that correct how
+    the Edge voices say a short word ("AVI", "Avi", "AI") are made for
+    "edge" only; everything else is the same for every engine.
     """
     # Lines cut by a narrow page (PDF copies) back into sentences, before
     # anything reads a line edge as a pause
@@ -923,15 +929,17 @@ def clean_text_for_speech(text, lang="en", breaks=False):
     text = _RE_URL.sub(_humanize_url, text)
     # Underscores between words -> spaces (e.g., my_function -> my function)
     text = re.sub(r'(?<=\w)_(?=\w)', ' ', text)
-    # "AVI" -> "Avi": a name, not an acronym
-    text = _RE_SPOKEN_AS_WORD.sub(lambda m: _SPOKEN_AS_WORD[m.group(1)], text)
-    if lang == "en":
-        text = _RE_SPOKEN_AS_WORD_EN.sub(
-            lambda m: _SPOKEN_AS_WORD_EN[m.group(1)], text)
-    # "AI’s" -> "A.I.’s"; French voices say "IA" as letters already, and
-    # read the dots as a pause ("I. A.")
-    if lang == "en":
-        text = _RE_SHORT_ACRONYM.sub(_dot_acronym, text)
+    if engine == "edge":
+        # "AVI" -> "Avi": a name, not an acronym
+        text = _RE_SPOKEN_AS_WORD.sub(
+            lambda m: _SPOKEN_AS_WORD[m.group(1)], text)
+        if lang == "en":
+            text = _RE_SPOKEN_AS_WORD_EN.sub(
+                lambda m: _SPOKEN_AS_WORD_EN[m.group(1)], text)
+        # "AI’s" -> "A.I.’s"; French voices say "IA" as letters already, and
+        # read the dots as a pause ("I. A.")
+        if lang == "en":
+            text = _RE_SHORT_ACRONYM.sub(_dot_acronym, text)
     if lang == "fr":
         text = _expand_french_dates(text)
         text = _expand_french_fractions(text)

@@ -68,6 +68,39 @@ class RequestTest(unittest.TestCase):
         self.assertIsNone(helper.request_language(None, "harper_32", settings))
 
 
+class ChunkTest(unittest.TestCase):
+    def test_pieces_stay_small_and_end_with_a_sentence(self):
+        text = " ".join(f"Sentence number {i} is here." for i in range(1, 80))
+        chunks = helper.chunk_text(text)
+        self.assertGreater(len(chunks), 3)
+        for chunk in chunks:
+            self.assertLessEqual(len(chunk), helper.CHUNK_CHARS)
+            self.assertTrue(chunk.endswith("."))
+        self.assertEqual(" ".join(chunks), text)
+
+    def test_a_long_enough_piece_ends_with_its_paragraph(self):
+        para = " ".join("This sentence fills a paragraph." for _ in range(9))
+        chunks = helper.chunk_text(para + "\n\nNext one. And more.")
+        self.assertEqual(chunks, [para, "Next one. And more."])
+
+    def test_short_paragraphs_are_asked_for_together(self):
+        self.assertEqual(helper.chunk_text("Title\n\nA short line.\nAnother."),
+                         ["Title\n\nA short line.\nAnother."])
+
+    def test_a_very_long_sentence_is_cut_between_words(self):
+        sentence = ", ".join(["a clause of several words"] * 60) + "."
+        chunks = helper.chunk_text(sentence)
+        self.assertGreater(len(chunks), 1)
+        for chunk in chunks:
+            self.assertLessEqual(len(chunk), helper.CHUNK_CHARS)
+        for chunk in chunks[:-1]:
+            self.assertTrue(chunk.endswith(","))
+        self.assertEqual(" ".join(chunks), sentence)
+        words = "word " * 300
+        self.assertEqual(" ".join(helper.chunk_text(words)).split(),
+                         words.split())
+
+
 class StreamTest(unittest.TestCase):
     def run_stream(self, responses, text="One. Two."):
         player = FakePlayer()
@@ -82,6 +115,23 @@ class StreamTest(unittest.TestCase):
         (reason, unread), player, _, _ = self.run_stream([io.BytesIO(b"mp3")])
         self.assertEqual((reason, unread), (None, ""))
         self.assertEqual(player.stdin.getvalue(), b"mp3")
+
+    def test_only_the_first_piece_keeps_its_id3_tag(self):
+        tag = b"ID3\x04\x00\x00\x00\x00\x00\x05TAGGY"
+        text = " ".join("This sentence fills a paragraph." for _ in range(20))
+        self.assertEqual(len(helper.chunk_text(text)), 2)
+        (reason, _), player, _, _ = self.run_stream(
+            [io.BytesIO(tag + b"one"), io.BytesIO(tag + b"two")], text)
+        self.assertIsNone(reason)
+        self.assertEqual(player.stdin.getvalue(), tag + b"one" + b"two")
+
+    def test_a_piece_without_a_tag_is_played_whole(self):
+        text = " ".join("This sentence fills a paragraph." for _ in range(20))
+        (_, _), player, _, _ = self.run_stream(
+            [io.BytesIO(b"first piece audio"), io.BytesIO(b"second piece audio")],
+            text)
+        self.assertEqual(player.stdin.getvalue(),
+                         b"first piece audio" + b"second piece audio")
 
     def test_used_up_allowance_hands_back_the_whole_text(self):
         body = json.dumps({"error": {"code": "payment_required",

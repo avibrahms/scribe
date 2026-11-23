@@ -42,10 +42,15 @@ SPEED_MIN, SPEED_MAX = 0.5, 4.0
 # language (a voice reading its own language needs none).
 LANG_LOCALES = {"en": "en-US", "fr": "fr-FR", "es": "es-ES",
                 "de": "de-DE", "it": "it-IT"}
-# The stream endpoint takes far more per request. Stay small anyway: a small
-# first chunk so audio starts quickly, then larger ones.
-FIRST_CHUNK_CHARS = 700
-MAX_CHUNK_CHARS = 3200
+# Speechify makes, and bills, a whole piece within a second of being asked,
+# so a Stop pays for the rest of the piece being read. Pieces are kept small
+# for that reason, but not down to one sentence: a few sentences asked for
+# together are said as one flowing passage, and sentences asked for one by
+# one come out slower and each on its own.
+CHUNK_CHARS = 500
+# A piece this long ends at the end of its paragraph, where a join between
+# two requests is least heard.
+PARAGRAPH_CHUNK_CHARS = 250
 # A refused request is retried when Speechify says it came too fast (the free
 # plan allows one a second), so a long read keeps its voice.
 RATE_LIMIT_RETRIES = 2
@@ -190,27 +195,38 @@ def load_api_key():
 _RE_SENTENCE = re.compile(r'(.+?(?:[.!?。！？\n]+|$))', re.S)
 
 
+def split_long_sentence(sentence, limit):
+    """A sentence longer than `limit`, cut after a comma, semicolon or colon
+    where there is one, else between two words, never inside a word."""
+    parts = []
+    while len(sentence) > limit:
+        cut = max(sentence.rfind(mark, 0, limit) for mark in (", ", "; ", ": "))
+        if cut < limit // 2:
+            cut = sentence.rfind(" ", 0, limit) - 1
+        if cut < 0:
+            cut = limit - 1  # one unbroken run of characters
+        parts.append(sentence[:cut + 1])
+        sentence = sentence[cut + 1:]
+    parts.append(sentence)
+    return parts
+
+
 def chunk_text(text):
-    """Split into <=MAX_CHUNK_CHARS pieces at sentence boundaries. The first
-    piece is kept small so the first audio arrives quickly."""
-    sentences = [s for s in _RE_SENTENCE.findall(text) if s.strip()]
+    """Split into pieces of at most CHUNK_CHARS, each ending with a sentence,
+    and with its paragraph once it is PARAGRAPH_CHUNK_CHARS long."""
     chunks = []
     buf = ""
-    limit = FIRST_CHUNK_CHARS
-    for s in sentences:
-        # A single oversized sentence: flush, then hard-split it.
-        if len(s) > limit and not buf:
-            for j in range(0, len(s), limit):
-                chunks.append(s[j:j + limit])
-            limit = MAX_CHUNK_CHARS
+    for sentence in _RE_SENTENCE.findall(text):
+        if not sentence.strip():
             continue
-        if len(buf) + len(s) > limit:
-            if buf:
+        for s in split_long_sentence(sentence, CHUNK_CHARS):
+            if buf and len(buf) + len(s) > CHUNK_CHARS:
                 chunks.append(buf)
-            buf = s
-            limit = MAX_CHUNK_CHARS
-        else:
+                buf = ""
             buf += s
+            if s.endswith("\n") and len(buf) >= PARAGRAPH_CHUNK_CHARS:
+                chunks.append(buf)
+                buf = ""
     if buf.strip():
         chunks.append(buf)
     return [c.strip() for c in chunks if c.strip()]
@@ -269,6 +285,22 @@ def retry_after(error):
     return min(RATE_LIMIT_MAX_WAIT, max(0.5, wait))
 
 
+def skip_id3(resp):
+    """Read past the ID3 tag each Speechify answer opens with and return the
+    audio bytes read along the way. Only the first piece keeps its tag: one in
+    the middle of the stream is not audio, and a player may trip on it."""
+    head = resp.read(10)
+    if len(head) < 10 or not head.startswith(b"ID3"):
+        return head
+    left = (head[6] << 21) | (head[7] << 14) | (head[8] << 7) | head[9]
+    while left > 0:
+        block = resp.read(min(left, 8192))
+        if not block:
+            break
+        left -= len(block)
+    return b""
+
+
 def stream_tts(text, voice, speed, language, api_key):
     """Stream Speechify audio for each chunk into one continuous player.
 
@@ -287,8 +319,10 @@ def stream_tts(text, voice, speed, language, api_key):
                 reason = None
                 try:
                     with urllib.request.urlopen(req, timeout=60) as resp:
+                        first = b"" if player is None else skip_id3(resp)
                         while True:
-                            block = resp.read(8192)
+                            block = first or resp.read(8192)
+                            first = b""
                             if not block:
                                 break
                             if player is None:
@@ -396,7 +430,8 @@ def main():
         speed = min(SPEED_MAX, max(SPEED_MIN, speed))
 
         text = (tts_text.clean_text_for_speech(
-                    args["text"], tts_text.speech_lang(args["text"], None))
+                    args["text"], tts_text.speech_lang(args["text"], None),
+                    engine="speechify")
                 if tts_text is not None else args["text"].strip())
         if not text:
             return

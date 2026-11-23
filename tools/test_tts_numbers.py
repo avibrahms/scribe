@@ -56,6 +56,17 @@ class FrenchNumbersTest(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertEqual(clean_text_for_speech(source, "en"), expected)
 
+    def test_short_word_respellings_are_for_edge_only(self):
+        for source in ("AI is here", "Avi and AVI's note", "the CEO's plan"):
+            with self.subTest(source=source):
+                self.assertEqual(
+                    clean_text_for_speech(source, "en", engine="speechify"),
+                    source)
+        # What every engine needs is still done.
+        self.assertEqual(
+            clean_text_for_speech("**AI** in 3s", "en", engine="speechify"),
+            "AI in 3 seconds")
+
     def test_detection_and_other_languages(self):
         for source in ("le lundi 26/10",
                        "Le partage n’oblige pas à donner à chacun 3/16 de chaque bien"):
