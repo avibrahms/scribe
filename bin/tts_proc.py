@@ -1,6 +1,6 @@
 """
 The one read at a time, shared by the read-aloud helpers (edge-tts-stream,
-openai-tts-stream) and deployed next to them.
+speechify-tts-stream) and deployed next to them.
 
 A helper that reads puts itself in its own process group and writes that
 group's id in PID_FILE. Whoever wants silence (a new read, `--stop`, Scribe)

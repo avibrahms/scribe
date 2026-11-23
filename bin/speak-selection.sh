@@ -2,17 +2,17 @@
 # Speak selected / clipboard text using the engine selected in Scribe.
 #
 # Reads the active engine from ~/.config/speak-selection/settings.json
-# ("engine": "openai" | "edge") so the global hotkey matches whatever you
-# picked in the Scribe menu. Edge, the free one, speaks unless OpenAI was
-# picked there, and whenever OpenAI is unavailable.
+# ("engine": "speechify" | "edge") so the global hotkey matches whatever you
+# picked in the Scribe menu. Edge, the free one, speaks unless Speechify was
+# picked there, and whenever Speechify is unavailable.
 #
 # Triggered via the "Speak Selection" Quick Action (⌃D) and the clipboard
 # one (⌃X). Accepts the text as $1, on stdin (--stdin), or from the clipboard.
 
 SETTINGS="$HOME/.config/speak-selection/settings.json"
-KEY_FILE="$HOME/.config/speak-selection/openai_key"
+KEY_FILE="$HOME/.config/speak-selection/speechify_key"
 EDGE="$HOME/bin/edge-tts-stream"
-OPENAI="$HOME/bin/openai-tts-stream"
+SPEECHIFY="$HOME/bin/speechify-tts-stream"
 
 # --- pick engine (default edge) -------------------------------------------
 ENGINE="edge"
@@ -21,13 +21,13 @@ if [ -f "$SETTINGS" ]; then
     [ -n "$E" ] && ENGINE="$E"
 fi
 
-if [ "$ENGINE" != "openai" ]; then
+if [ "$ENGINE" != "speechify" ]; then
     HELPER="$EDGE"
 else
-    HELPER="$OPENAI"
-    # OpenAI unusable (no helper or no key anywhere)? fall back to Edge so
+    HELPER="$SPEECHIFY"
+    # Speechify unusable (no helper or no key anywhere)? fall back to Edge so
     # the hotkey still speaks instead of silently doing nothing.
-    if [ ! -x "$HELPER" ] || { [ -z "$OPENAI_API_KEY" ] && [ ! -s "$KEY_FILE" ]; }; then
+    if [ ! -x "$HELPER" ] || { [ -z "$SPEECHIFY_API_KEY" ] && [ ! -s "$KEY_FILE" ]; }; then
         HELPER="$EDGE"
     fi
 fi
@@ -42,7 +42,7 @@ else
 fi
 [ -z "$TEXT" ] && exit 0
 
-# The helpers stop any current playback themselves, read voice/instructions
+# The helpers stop any current playback themselves, read their voice
 # from settings.json, and clean up. When synthesis fails they exit 1 with a
 # "[…-tts] reason" line on stderr (Stop kills them by signal instead), so say
 # why rather than leaving the hotkey silently dead.

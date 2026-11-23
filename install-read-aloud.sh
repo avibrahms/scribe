@@ -31,14 +31,16 @@ fi
 # --- helpers ---------------------------------------------------------------
 echo "==> installing read-aloud helpers in $BIN_DIR"
 mkdir -p "$BIN_DIR"
-for f in edge-tts-stream openai-tts-stream speak-selection.sh \
+for f in edge-tts-stream speechify-tts-stream speak-selection.sh \
          tts_proc.py tts_lang.py tts_text.py tts_fallback.py; do
     cp "$REPO_DIR/bin/$f" "$BIN_DIR/$f.new"
     mv -f "$BIN_DIR/$f.new" "$BIN_DIR/$f"   # never a half-written helper
 done
+# The helper of the OpenAI engine, which Speechify replaced.
+rm -f "$BIN_DIR/openai-tts-stream"
 # The Edge helper runs with the Python that has edge-tts.
 sed -i '' "1s|.*|#!$EDGE_PYTHON|" "$BIN_DIR/edge-tts-stream"
-chmod +x "$BIN_DIR/edge-tts-stream" "$BIN_DIR/openai-tts-stream" \
+chmod +x "$BIN_DIR/edge-tts-stream" "$BIN_DIR/speechify-tts-stream" \
          "$BIN_DIR/speak-selection.sh"
 # A standby still holding the previous helper steps aside by itself; this
 # only saves it the wait.

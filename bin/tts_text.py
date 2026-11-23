@@ -1,6 +1,6 @@
 """
 Text preparation shared by the read-aloud helpers (edge-tts-stream,
-openai-tts-stream), deployed next to them like tts_lang.py.
+speechify-tts-stream), deployed next to them like tts_lang.py.
 
 Turns markdown, tables, symbols and terse notation into text a voice reads
 the way a person would: "3s" becomes "3 seconds", an arrow or an emoji

@@ -1,58 +1,60 @@
 #!/usr/bin/env python3
 """
-Stream OpenAI text-to-speech (gpt-4o-mini-tts) with low latency and a reliable
+Stream Speechify text-to-speech (simba-3.5) with low latency and a reliable
 stop, designed as a drop-in sibling of `edge-tts-stream`.
 
 It shares the SAME pid file and the SAME audio player (sox `play`) as
 edge-tts-stream so Scribe's existing three-path stop logic silences it too.
 
-No third-party packages: the OpenAI Audio Speech REST endpoint is called with
+No third-party packages: Speechify's streaming REST endpoint is called with
 the standard library (urllib + ssl), and the streamed MP3 body is piped
 straight into `play -t mp3 -`.
 
-The API key is read from $OPENAI_API_KEY, or from
-~/.config/speak-selection/openai_key (0600). It is never written to the repo.
+The API key is read from $SPEECHIFY_API_KEY, or from
+~/.config/speak-selection/speechify_key (0600). It is never written to the
+repo.
 """
 import json
 import os
 import re
 import subprocess
 import sys
+import time
 import urllib.request
 import urllib.error
+from xml.sax.saxutils import escape
 
 # Shared with edge-tts-stream, deployed alongside: only one read runs at a
 # time, and `edge-tts-stream --stop` (and Scribe's stop) kills ours too.
 from tts_proc import CONFIG_DIR, claim, release, stop_existing
 
 SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
-KEY_FILE = os.path.join(CONFIG_DIR, "openai_key")
+KEY_FILE = os.path.join(CONFIG_DIR, "speechify_key")
 
 PLAYER_CMD = ["/opt/homebrew/bin/play", "-t", "mp3", "-q", "-"]
 
-API_URL = "https://api.openai.com/v1/audio/speech"
-DEFAULT_MODEL = "gpt-4o-mini-tts"
-DEFAULT_VOICE = "coral"
-DEFAULT_INSTRUCTIONS = (
-    "Perform this text aloud like an expressive human storyteller — never a "
-    "narrator droning through a script. Constantly vary your pitch, pace, and "
-    "volume: rise with excitement, slow down and lower your voice for emphasis "
-    "or suspense, lift the ends of questions, and let energy build and release "
-    "across sentences. Use clear emotional ups and downs that match the meaning "
-    "of the words — warmth, curiosity, surprise, enthusiasm. Add natural human "
-    "rhythm with small pauses for breath and thought. Absolutely avoid a flat, "
-    "monotone, robotic, or detached delivery; every sentence should sound alive "
-    "and genuinely felt."
-)
-# The speech endpoint caps input at 4096 chars. Stay well under, and make the
-# first chunk small so audio starts quickly, then use larger chunks.
+API_URL = "https://api.speechify.ai/v1/audio/stream"
+MODEL = "simba-3.5"
+DEFAULT_VOICE = "harper_32"
+# Speed is sent as an SSML prosody rate, which starts at -50%.
+SPEED_MIN, SPEED_MAX = 0.5, 4.0
+# The locale sent as `language` when the text is not in the voice's own
+# language (a voice reading its own language needs none).
+LANG_LOCALES = {"en": "en-US", "fr": "fr-FR", "es": "es-ES",
+                "de": "de-DE", "it": "it-IT"}
+# The stream endpoint takes far more per request. Stay small anyway: a small
+# first chunk so audio starts quickly, then larger ones.
 FIRST_CHUNK_CHARS = 700
 MAX_CHUNK_CHARS = 3200
+# A refused request is retried when Speechify says it came too fast (the free
+# plan allows one a second), so a long read keeps its voice.
+RATE_LIMIT_RETRIES = 2
+RATE_LIMIT_MAX_WAIT = 10.0
 
 
 def parse_args():
     args = {"stop": False, "text": None, "stdin": False,
-            "voice": None, "instructions": None, "model": None, "speed": None}
+            "voice": None, "speed": None}
     i = 1
     while i < len(sys.argv):
         a = sys.argv[i]
@@ -70,16 +72,6 @@ def parse_args():
             args["voice"] = sys.argv[i]
         elif a.startswith("--voice="):
             args["voice"] = a[8:]
-        elif a == "--instructions" and i + 1 < len(sys.argv):
-            i += 1
-            args["instructions"] = sys.argv[i]
-        elif a.startswith("--instructions="):
-            args["instructions"] = a[len("--instructions="):]
-        elif a == "--model" and i + 1 < len(sys.argv):
-            i += 1
-            args["model"] = sys.argv[i]
-        elif a.startswith("--model="):
-            args["model"] = a[8:]
         elif a == "--speed" and i + 1 < len(sys.argv):
             i += 1
             args["speed"] = sys.argv[i]
@@ -111,40 +103,61 @@ try:
 except Exception:
     tts_text = None
 
-# The free sibling that takes over when OpenAI can't speak (no key, no
-# credits, no network). It falls back further, to the Mac's voice, by itself.
+# The free sibling that takes over when Speechify can't speak (no key, the
+# month's free characters used up, no network). It falls back further, to the Mac's voice, by itself.
 EDGE_HELPER = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "edge-tts-stream")
 
 
-def auto_voice(text, settings, explicit):
-    """Voice to speak `text` with: an explicit --voice always wins.
+def detect_lang(text, settings):
+    """Language code of `text`, or None when unsure or auto-detect is off."""
+    if tts_lang is None or not settings.get("tts_autodetect", True):
+        return None
+    try:
+        return tts_lang.detect_language(text)
+    except Exception:
+        return None
+
+
+def auto_voice(lang, settings, explicit):
+    """Voice to speak text of language `lang` with: an explicit --voice always
+    wins.
 
     Mirrors scribe_core.resolve_tts_voice so the ⌃D Quick Action and the app
     menu pick the same voice for the same text.
     """
     if explicit:
         return explicit
-    default = settings["openai_voice"]
-    if tts_lang is None or not settings.get("tts_autodetect", True):
+    default = settings["speechify_voice"]
+    if tts_lang is None or not lang:
         return default
     try:
-        lang = tts_lang.detect_language(text)
         return tts_lang.voice_for_lang(
-            settings.get("openai_voice_by_lang"), lang, default,
-            settings.get("openai_lang_defaults"))
+            settings.get("speechify_voice_by_lang"), lang, default,
+            settings.get("speechify_lang_defaults"))
     except Exception:
         return default
 
 
+def request_language(lang, voice, settings):
+    """The `language` to send, or None when the voice reads its own language
+    (or the language of the text is unknown)."""
+    if not lang:
+        return None
+    voice_langs = settings.get("speechify_voice_langs")
+    own = voice_langs.get(voice) if isinstance(voice_langs, dict) else None
+    if own == lang:
+        return None
+    return LANG_LOCALES.get(lang)
+
+
 def load_settings():
     settings = {
-        "openai_voice": DEFAULT_VOICE,
-        "openai_instructions": DEFAULT_INSTRUCTIONS,
-        "openai_model": DEFAULT_MODEL,
-        "openai_speed": 1.0,
-        "openai_voice_by_lang": {},
-        "openai_lang_defaults": {},
+        "speechify_voice": DEFAULT_VOICE,
+        "speechify_speed": 1.0,
+        "speechify_voice_by_lang": {},
+        "speechify_lang_defaults": {},
+        "speechify_voice_langs": {},
         "tts_autodetect": True,
     }
     if os.path.exists(SETTINGS_FILE):
@@ -164,7 +177,7 @@ def load_settings():
 
 
 def load_api_key():
-    key = (os.environ.get("OPENAI_API_KEY") or "").strip()
+    key = (os.environ.get("SPEECHIFY_API_KEY") or "").strip()
     if key:
         return key
     try:
@@ -204,15 +217,60 @@ def chunk_text(text):
 
 
 def api_error_message(body):
-    """The human-readable message inside an OpenAI error body, else the body."""
+    """The human-readable message inside a Speechify error body, else the body."""
     try:
         return str(json.loads(body)["error"]["message"])
     except Exception:
         return body.strip()
 
 
-def stream_tts(text, voice, instructions, model, speed, api_key):
-    """Stream OpenAI TTS audio for each chunk into one continuous player.
+def to_ssml(chunk, speed):
+    """`chunk` as SSML, at `speed` times the normal rate.
+
+    Always SSML, never plain text: Speechify decides by itself whether an
+    input is SSML, so a plain "<" or "&" must not be left for it to guess at.
+    """
+    body = escape(chunk, {'"': "&quot;", "'": "&apos;"})
+    percent = round((speed - 1.0) * 100)
+    if percent:
+        body = f'<prosody rate="{percent:+d}%">{body}</prosody>'
+    return f"<speak>{body}</speak>"
+
+
+def build_request(chunk, voice, speed, language, api_key):
+    body = {
+        "model": MODEL,
+        "voice_id": voice,
+        "input": to_ssml(chunk, speed),
+        # Numbers and dates spoken as words.
+        "options": {"text_normalization": True},
+    }
+    if language:
+        body["language"] = language
+    return urllib.request.Request(
+        API_URL,
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "audio/mpeg",
+            "User-Agent": "scribe-read-aloud",
+        },
+        method="POST",
+    )
+
+
+def retry_after(error):
+    """Seconds Speechify asks to wait before the next request."""
+    try:
+        wait = float(error.headers.get("Retry-After") or 1.0)
+    except (TypeError, ValueError):
+        wait = 1.0
+    return min(RATE_LIMIT_MAX_WAIT, max(0.5, wait))
+
+
+def stream_tts(text, voice, speed, language, api_key):
+    """Stream Speechify audio for each chunk into one continuous player.
 
     Returns (reason, unread): why synthesis stopped and the text not yet
     spoken, or (None, "") when it all played or a Stop cut it short.
@@ -223,52 +281,41 @@ def stream_tts(text, voice, instructions, model, speed, api_key):
     player = None
     try:
         for chunk in chunks:
-            body = {
-                "model": model,
-                "voice": voice,
-                "input": chunk,
-                "response_format": "mp3",
-                "speed": speed,
-            }
-            # Only gpt-4o-* models accept `instructions`; tts-1 / tts-1-hd
-            # reject it. Send it solely where it does something.
-            if instructions and model.startswith("gpt-4o"):
-                body["instructions"] = instructions
-            payload = json.dumps(body).encode("utf-8")
-            req = urllib.request.Request(
-                API_URL,
-                data=payload,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                method="POST",
-            )
-            try:
-                with urllib.request.urlopen(req, timeout=60) as resp:
-                    while True:
-                        block = resp.read(8192)
-                        if not block:
-                            break
-                        if player is None:
-                            # Started on the first audio, so a refused
-                            # request never leaves an empty player printing
-                            # half a line into our stderr.
-                            player = subprocess.Popen(
-                                PLAYER_CMD, stdin=subprocess.PIPE)
-                        player.stdin.write(block)
-                        player.stdin.flush()
-            except urllib.error.HTTPError as e:
-                detail = ""
+            req = build_request(chunk, voice, speed, language, api_key)
+            retries = RATE_LIMIT_RETRIES
+            while True:
+                reason = None
                 try:
-                    detail = api_error_message(e.read().decode("utf-8", "replace"))
-                except Exception:
-                    pass
-                detail = " ".join(detail.split())[:300]
-                reason = f"HTTP {e.code}: {detail}"
+                    with urllib.request.urlopen(req, timeout=60) as resp:
+                        while True:
+                            block = resp.read(8192)
+                            if not block:
+                                break
+                            if player is None:
+                                # Started on the first audio, so a refused
+                                # request never leaves an empty player
+                                # printing half a line into our stderr.
+                                player = subprocess.Popen(
+                                    PLAYER_CMD, stdin=subprocess.PIPE)
+                            player.stdin.write(block)
+                            player.stdin.flush()
+                except urllib.error.HTTPError as e:
+                    if e.code == 429 and retries > 0:
+                        retries -= 1
+                        time.sleep(retry_after(e))
+                        continue
+                    detail = ""
+                    try:
+                        detail = api_error_message(
+                            e.read().decode("utf-8", "replace"))
+                    except Exception:
+                        pass
+                    detail = " ".join(detail.split())[:300]
+                    reason = f"HTTP {e.code}: {detail}"
+                except urllib.error.URLError as e:
+                    reason = f"network error: {e.reason}"
                 break
-            except urllib.error.URLError as e:
-                reason = f"network error: {e.reason}"
+            if reason is not None:
                 break
             played += 1
         if reason is None and player is not None:
@@ -305,7 +352,7 @@ def hand_off_to_edge(text, reason):
     if tts_fallback is None or not os.access(EDGE_HELPER, os.X_OK):
         return
     tts_fallback.notify("Read aloud: using Microsoft Edge",
-                        f"OpenAI failed: {reason}")
+                        f"Speechify failed: {reason}")
     try:
         tts_fallback.exec_with_stdin([EDGE_HELPER, "--stdin"], text)
     except OSError:
@@ -332,21 +379,21 @@ def main():
 
         api_key = load_api_key()
         if not api_key:
-            reason = f"no API key (set OPENAI_API_KEY or {KEY_FILE})"
-            print(f"[openai-tts] {reason}", file=sys.stderr)
+            reason = f"no API key (set SPEECHIFY_API_KEY or {KEY_FILE})"
+            print(f"[speechify-tts] {reason}", file=sys.stderr)
             hand_off_to_edge(args["text"], reason)
             return 1
 
         settings = load_settings()
-        voice = auto_voice(args["text"], settings, args["voice"])
-        instructions = args["instructions"] or settings["openai_instructions"]
-        model = args["model"] or settings["openai_model"]
+        lang = detect_lang(args["text"], settings)
+        voice = auto_voice(lang, settings, args["voice"])
+        language = request_language(lang, voice, settings)
         try:
             speed = float(args["speed"] if args["speed"] is not None
-                          else settings["openai_speed"])
+                          else settings["speechify_speed"])
         except (TypeError, ValueError):
             speed = 1.0
-        speed = min(4.0, max(0.25, speed))
+        speed = min(SPEED_MAX, max(SPEED_MIN, speed))
 
         text = (tts_text.clean_text_for_speech(
                     args["text"], tts_text.speech_lang(args["text"], None))
@@ -356,14 +403,14 @@ def main():
 
         try:
             reason, unread = stream_tts(
-                text, voice, instructions, model, speed, api_key)
+                text, voice, speed, language, api_key)
         except (KeyboardInterrupt, SystemExit):
             return
         if reason is None:
             return
         # Scribe and speak-selection.sh show this line to the user when
         # nothing else speaks either, so a failure is never silent.
-        print(f"[openai-tts] {reason}", file=sys.stderr)
+        print(f"[speechify-tts] {reason}", file=sys.stderr)
         hand_off_to_edge(unread, reason)
         return 1
     finally:

@@ -1,8 +1,8 @@
 """
 Fallbacks shared by the read-aloud helpers (edge-tts-stream,
-openai-tts-stream), deployed next to them like tts_lang.py.
+speechify-tts-stream), deployed next to them like tts_lang.py.
 
-Read aloud degrades instead of going silent: OpenAI hands its text to Edge,
+Read aloud degrades instead of going silent: Speechify hands its text to Edge,
 and Edge, once every endpoint and a library upgrade have failed, hands it to
 the Mac's own speech synthesizer. Everything here uses only what ships with
 macOS, so it keeps working when every online voice is down.

@@ -5,7 +5,7 @@ Scribe — macOS menubar app for voice in and voice out.
 Two things in one:
 
   • TTS  — free Microsoft Edge voices via the `edge-tts` package, or
-           OpenAI's. The menu's choices are mirrored in
+           Speechify's. The menu's choices are mirrored in
            ~/.config/speak-selection/settings.json, which the read-aloud
            helpers in ~/bin (and so the ⌃D / ⌃X hotkeys) read.
 
@@ -63,10 +63,7 @@ from scribe_core import (
     SETTINGS_FILE,
     VOICES,
     DEFAULT_VOICE,
-    OPENAI_VOICES,
-    OPENAI_TTS_MODEL,
-    OPENAI_MODELS,
-    DEFAULT_TTS_INSTRUCTIONS,
+    SPEECHIFY_VOICES,
     Recorder,
     prewarm_recorder,
     load_dotenv as _load_dotenv,
@@ -86,29 +83,26 @@ from scribe_core import (
     save_voice,
     load_tts_engine,
     save_tts_engine,
-    load_openai_voice,
-    save_openai_voice,
-    load_tts_instructions,
-    save_tts_instructions,
-    load_openai_model,
-    save_openai_model,
-    load_openai_speed,
-    save_openai_speed,
+    load_speechify_voice,
+    save_speechify_voice,
+    speechify_voice_name,
+    load_speechify_speed,
+    save_speechify_speed,
     load_edge_rate,
     load_edge_pitch,
     load_edge_volume,
     save_edge_prosody,
-    openai_api_key,
-    save_openai_key,
+    speechify_api_key,
+    save_speechify_key,
     TTS_LANGS,
     TTS_LANG_LABELS,
     lang_of_voice,
     load_tts_autodetect,
     save_tts_autodetect,
     load_edge_voice_map,
-    load_openai_voice_map,
+    load_speechify_voice_map,
     save_edge_voice_for_lang,
-    save_openai_voice_for_lang,
+    save_speechify_voice_for_lang,
     resolve_tts_voice,
     effective_tts_voice,
     sync_speak_settings,
@@ -165,20 +159,20 @@ from Quartz import (
 _load_dotenv(DOTENV_FILE)
 
 EDGE_TTS_STREAM = Path.home() / "bin" / "edge-tts-stream"
-OPENAI_TTS_STREAM = Path.home() / "bin" / "openai-tts-stream"
+SPEECHIFY_TTS_STREAM = Path.home() / "bin" / "speechify-tts-stream"
 # Written by whichever helper is reading, removed when it ends.
 TTS_PID_FILE = Path.home() / ".config" / "speak-selection" / "speak.pid"
 # Every process a read can leave behind, as one pattern for one pkill.
 _TTS_STRAY_PATTERN = "|".join((
     "edge-tts-stream --(stdin|text)",
-    "openai-tts-stream --(stdin|text)",
+    "speechify-tts-stream --(stdin|text)",
     "/opt/homebrew/bin/play -t mp3",
     "scribe-say-",  # the Mac-voice fallback's text file (tts_fallback)
 ))
 
 # Both helpers explain a failed synthesis in one "[…-tts] reason" stderr line.
-_RE_TTS_HELPER_ERROR = re.compile(r"^\[(?:edge|openai)-tts\] (.+)$", re.M)
-_TTS_ENGINE_NAMES = {"openai": "OpenAI", "edge": "Microsoft Edge"}
+_RE_TTS_HELPER_ERROR = re.compile(r"^\[(?:edge|speechify)-tts\] (.+)$", re.M)
+_TTS_ENGINE_NAMES = {"speechify": "Speechify", "edge": "Microsoft Edge"}
 
 
 def _tts_failure_reason(stderr_text: str, code: int) -> str:
@@ -195,7 +189,7 @@ def _tts_failure_reason(stderr_text: str, code: int) -> str:
 # requires touching code — selecting an item persists it and the helpers pick
 # it up on the next utterance.
 
-OPENAI_SPEED_PRESETS = [
+SPEECHIFY_SPEED_PRESETS = [
     ("0.5× — very slow", 0.5), ("0.75× — slow", 0.75), ("0.9×", 0.9),
     ("1.0× — normal", 1.0), ("1.1×", 1.1), ("1.25× — brisk", 1.25),
     ("1.5× — fast", 1.5), ("2.0× — very fast", 2.0),
@@ -218,39 +212,11 @@ EDGE_VOLUME_PRESETS = [
     ("+25%", "+25%"), ("+50% — loud", "+50%"), ("+100% — max", "+100%"),
 ]
 
-# Named emotion/tone presets for gpt-4o-mini-tts. The value is the full
-# `instructions` string the model is steered with; "Custom…" lets the user
-# type their own. The first entry mirrors the shared default.
-EMOTION_PRESETS = [
-    ("Expressive storyteller (default)", DEFAULT_TTS_INSTRUCTIONS),
-    ("Calm & soothing",
-     "Read in a calm, soothing, gentle voice. Keep the pace slow and "
-     "relaxed, the tone soft, warm and reassuring, with smooth, unhurried "
-     "delivery and a peaceful, comforting feel throughout."),
-    ("Energetic & upbeat",
-     "Read with high, bouncy energy — fast-paced, enthusiastic and lively. "
-     "Use big dynamic range, bright rising intonation, and an excited, "
-     "infectious, can't-wait-to-tell-you delivery."),
-    ("Warm & friendly",
-     "Read in a warm, friendly, conversational tone, as if chatting with a "
-     "close friend. Relaxed, kind and natural, with gentle emotional "
-     "inflection and an easy, genuine smile in the voice."),
-    ("Professional newscaster",
-     "Read like a polished news anchor: clear, confident, articulate and "
-     "authoritative. Measured pacing, crisp diction and composed, credible "
-     "delivery — engaged but never theatrical."),
-    ("Dramatic & theatrical",
-     "Perform with theatrical drama. Use big emotional swings, suspenseful "
-     "pauses, intense highs and hushed lows, and rich expressive colour, as "
-     "if narrating a gripping story on stage."),
-]
-
-
 def _parse_speed(raw: str):
     """'1.25', '1.25×', '2' -> clamped float, or None if not a number."""
     raw = raw.strip().rstrip("×x").strip()
     try:
-        return min(4.0, max(0.25, round(float(raw), 2)))
+        return min(4.0, max(0.5, round(float(raw), 2)))
     except ValueError:
         return None
 
@@ -760,7 +726,7 @@ class ScribeApp(rumps.App):
         self._last_paste_bundle: str | None = None
         self._last_paste_ts: float = 0.0
 
-        # The TTS playback child we spawned (edge- or openai-tts-stream).
+        # The TTS playback child we spawned (edge- or speechify-tts-stream).
         # Stop must never depend solely on edge-tts-stream's PID file: a
         # child that wedges before writing it (seen in the wild, stuck in
         # sys.stdin.read()) is invisible to `--stop` forever. Holding the
@@ -770,11 +736,9 @@ class ScribeApp(rumps.App):
 
         self.current_voice = load_voice()
         self.tts_engine = load_tts_engine()
-        self.openai_voice = load_openai_voice()
+        self.speechify_voice = load_speechify_voice()
         # All menu-tweakable TTS params, persisted across relaunch.
-        self.openai_model = load_openai_model()
-        self.openai_speed = load_openai_speed()
-        self.openai_instructions = load_tts_instructions()
+        self.speechify_speed = load_speechify_speed()
         self.edge_rate = load_edge_rate()
         self.edge_pitch = load_edge_pitch()
         self.edge_volume = load_edge_volume()
@@ -789,7 +753,7 @@ class ScribeApp(rumps.App):
         # these registries let _refresh_voice_marks re-derive every check
         # mark from config after any pick.
         self.tts_autodetect = load_tts_autodetect()
-        self._voice_items: dict[str, list] = {"edge": [], "openai": []}
+        self._voice_items: dict[str, list] = {"edge": [], "speechify": []}
         self._autodetect_items: list[rumps.MenuItem] = []
 
         # Reconcile the helpers' settings.json with our config before the
@@ -828,10 +792,10 @@ class ScribeApp(rumps.App):
                 mi.state = 1
             self.hotkey_menu.add(mi)
 
-        # TTS engine picker (OpenAI vs Microsoft Edge). Persisted choice.
+        # TTS engine picker (Speechify vs Microsoft Edge). Persisted choice.
         self.engine_menu = rumps.MenuItem("TTS Engine")
         for eng_id, eng_label in (
-            ("openai", "OpenAI · natural, emotional"),
+            ("speechify", "Speechify · most natural"),
             ("edge", "Microsoft Edge · free"),
         ):
             mi = rumps.MenuItem(eng_label, callback=self._make_engine_cb(eng_id))
@@ -839,25 +803,19 @@ class ScribeApp(rumps.App):
                 mi.state = 1
             self.engine_menu.add(mi)
 
-        # --- OpenAI TTS: voice + every tunable, all in one submenu --------
-        self.openai_menu = rumps.MenuItem("OpenAI TTS — tuning")
+        # --- Speechify TTS: voice + every tunable, all in one submenu -----
+        self.speechify_menu = rumps.MenuItem("Speechify TTS — tuning")
         #   Voice — one pick per language, plus the fallback default.
-        self.openai_voice_menu = self._build_voice_menu("openai")
-        self.openai_menu.add(self.openai_voice_menu)
-        #   Emotion / tone (the steering instructions — biggest lever)
-        self.openai_menu.add(self._build_emotion_menu())
+        self.speechify_voice_menu = self._build_voice_menu("speechify")
+        self.speechify_menu.add(self.speechify_voice_menu)
         #   Speed
-        self.openai_menu.add(self._build_choice_menu(
-            "Speed", OPENAI_SPEED_PRESETS,
-            lambda: self.openai_speed, self._set_openai_speed,
+        self.speechify_menu.add(self._build_choice_menu(
+            "Speed", SPEECHIFY_SPEED_PRESETS,
+            lambda: self.speechify_speed, self._set_speechify_speed,
             fmt=lambda v: f"{float(v):g}×",
-            custom={"title": "OpenAI speed",
-                    "message": "Playback speed multiplier (0.25 – 4.0).",
+            custom={"title": "Speechify speed",
+                    "message": "Playback speed multiplier (0.5 – 4.0).",
                     "parse": _parse_speed}))
-        #   Model
-        self.openai_menu.add(self._build_choice_menu(
-            "Model", OPENAI_MODELS,
-            lambda: self.openai_model, self._set_openai_model))
 
         # --- Microsoft Edge TTS: voice + every tunable --------------------
         self.edge_menu = rumps.MenuItem("Microsoft Edge TTS — tuning")
@@ -950,15 +908,15 @@ class ScribeApp(rumps.App):
 
         # Key status
         self.set_key_item = rumps.MenuItem("Set Groq API key…", callback=self.on_set_key)
-        self.set_openai_key_item = rumps.MenuItem(
-            "Set OpenAI API key…", callback=self.on_set_openai_key
+        self.set_speechify_key_item = rumps.MenuItem(
+            "Set Speechify API key…", callback=self.on_set_speechify_key
         )
 
         self.menu = [
             self.status_item,
             None,
             self.engine_menu,
-            self.openai_menu,
+            self.speechify_menu,
             self.edge_menu,
             self.read_selected_item,
             self.read_copied_item,
@@ -972,7 +930,7 @@ class ScribeApp(rumps.App):
             None,
             self.perms_item,
             self.set_key_item,
-            self.set_openai_key_item,
+            self.set_speechify_key_item,
             None,
             rumps.MenuItem("Quit Scribe", callback=self._quit),
         ]
@@ -1027,11 +985,10 @@ class ScribeApp(rumps.App):
 
     def _voice_groups(self, engine: str) -> list[tuple[str, str, list]]:
         """(submenu title, language code, [(label, voice_id), ...]) per group."""
-        if engine == "openai":
-            # OpenAI voices are language-neutral, so every language offers the
-            # same catalogue and the pick is purely the user's preference.
-            return [(TTS_LANG_LABELS[lang], lang, list(OPENAI_VOICES))
-                    for lang in TTS_LANGS]
+        if engine == "speechify":
+            return [(title, lang, list(voices))
+                    for title, lang, voices in SPEECHIFY_VOICES
+                    if lang in TTS_LANGS and voices]
         # Edge voices are locale-bound: keep the existing English (US/UK/AU),
         # French, … grouping and derive each group's language from its voices.
         groups = []
@@ -1044,8 +1001,9 @@ class ScribeApp(rumps.App):
         return groups
 
     def _all_voices(self, engine: str) -> list[tuple[str, str]]:
-        if engine == "openai":
-            return list(OPENAI_VOICES)
+        if engine == "speechify":
+            return [v for _title, _lang, voices in SPEECHIFY_VOICES
+                    for v in voices]
         return [v for voices in VOICES.values() for v in voices]
 
     def _build_voice_menu(self, engine: str) -> rumps.MenuItem:
@@ -1099,7 +1057,8 @@ class ScribeApp(rumps.App):
         slot, so picking William in English (AU) must clear Ava in
         English (US).
         """
-        default = self.openai_voice if engine == "openai" else self.current_voice
+        default = (self.speechify_voice if engine == "speechify"
+                   else self.current_voice)
         for lang, voice_id, item in self._voice_items[engine]:
             if lang is None:
                 item.state = 1 if voice_id == default else 0
@@ -1123,12 +1082,12 @@ class ScribeApp(rumps.App):
 
     def _make_lang_voice_cb(self, engine: str, lang: str, voice_id: str):
         def cb(_sender: rumps.MenuItem) -> None:
-            if engine == "openai":
-                save_openai_voice_for_lang(lang, voice_id)
+            if engine == "speechify":
+                save_speechify_voice_for_lang(lang, voice_id)
             else:
                 save_edge_voice_for_lang(lang, voice_id)
             self._refresh_voice_marks(engine)
-            label = "OpenAI" if engine == "openai" else "Edge"
+            label = "Speechify" if engine == "speechify" else "Edge"
             rumps.notification(
                 f"{label} voice — {TTS_LANG_LABELS.get(lang, lang)}",
                 voice_id, "",
@@ -1137,14 +1096,14 @@ class ScribeApp(rumps.App):
 
     def _make_default_voice_cb(self, engine: str, voice_id: str):
         def cb(_sender: rumps.MenuItem) -> None:
-            if engine == "openai":
-                self.openai_voice = voice_id
-                save_openai_voice(voice_id)
+            if engine == "speechify":
+                self.speechify_voice = voice_id
+                save_speechify_voice(voice_id)
             else:
                 self.current_voice = voice_id
                 save_voice(voice_id)
             self._refresh_voice_marks(engine)
-            label = "OpenAI" if engine == "openai" else "Edge"
+            label = "Speechify" if engine == "speechify" else "Edge"
             rumps.notification(f"{label} default voice", voice_id, "")
         return cb
 
@@ -1155,7 +1114,7 @@ class ScribeApp(rumps.App):
             sender.state = 1
             self.tts_engine = engine_id
             save_tts_engine(engine_id)
-            label = "OpenAI (natural, emotional)" if engine_id == "openai" \
+            label = "Speechify (most natural)" if engine_id == "speechify" \
                 else "Microsoft Edge (free)"
             rumps.notification("TTS engine", label, "")
         return cb
@@ -1219,73 +1178,11 @@ class ScribeApp(rumps.App):
             menu.add(rumps.MenuItem("Custom…", callback=custom_cb))
         return menu
 
-    # -- emotion / tone submenu (gpt-4o-mini-tts instructions) -------------
-    def _build_emotion_menu(self):
-        menu = rumps.MenuItem("Emotion / tone")
-        preset_items: list[tuple[str, rumps.MenuItem]] = []
-
-        def mark(active_text):
-            matched = False
-            for text, it in preset_items:
-                on = text.strip() == (active_text or "").strip()
-                it.state = 1 if on else 0
-                matched = matched or on
-            self._emotion_custom_item.state = 0 if matched else 1
-
-        def make_cb(text):
-            def cb(_sender):
-                self._set_instructions(text)
-                mark(text)
-            return cb
-
-        for label, text in EMOTION_PRESETS:
-            it = rumps.MenuItem(label, callback=make_cb(text))
-            menu.add(it)
-            preset_items.append((text, it))
-
-        menu.add(None)
-
-        def custom_cb(_sender):
-            with _foreground_app():
-                win = rumps.Window(
-                    title="Custom emotion / tone",
-                    message="Describe exactly how the voice should perform "
-                            "(tone, emotion, pacing, accent). gpt-4o-mini-tts "
-                            "follows this instruction.",
-                    default_text=self.openai_instructions,
-                    ok="Save", cancel="Cancel",
-                    dimensions=(380, 130),
-                )
-                resp = win.run()
-            if not resp.clicked:
-                return
-            text = resp.text.strip()
-            if not text:
-                return
-            self._set_instructions(text)
-            mark(text)
-
-        self._emotion_custom_item = rumps.MenuItem("Custom…", callback=custom_cb)
-        menu.add(self._emotion_custom_item)
-        # Initial check state reflects the persisted instruction.
-        mark(self.openai_instructions)
-        return menu
-
     # -- setters: persist + apply, shared by presets and Custom… ----------
-    def _set_openai_model(self, model: str) -> None:
-        self.openai_model = model
-        save_openai_model(model)
-        rumps.notification("OpenAI model", model, "")
-
-    def _set_openai_speed(self, speed: float) -> None:
-        self.openai_speed = float(speed)
-        save_openai_speed(speed)
-        rumps.notification("OpenAI speed", f"{float(speed):g}×", "")
-
-    def _set_instructions(self, text: str) -> None:
-        self.openai_instructions = text
-        save_tts_instructions(text)
-        rumps.notification("OpenAI emotion / tone updated", "", text[:90])
+    def _set_speechify_speed(self, speed: float) -> None:
+        self.speechify_speed = float(speed)
+        save_speechify_speed(speed)
+        rumps.notification("Speechify speed", f"{float(speed):g}×", "")
 
     def _set_edge_rate(self, rate: str) -> None:
         self.edge_rate = rate
@@ -1636,15 +1533,15 @@ class ScribeApp(rumps.App):
             os.environ["GROQ_API_KEY"] = new_key
             rumps.notification("Groq key saved", "", f"Written to {DOTENV_FILE}")
 
-    def on_set_openai_key(self, _sender) -> None:
+    def on_set_speechify_key(self, _sender) -> None:
         # Masked-ish entry: show only a hint of any existing key, never the
         # whole secret, in the prefilled field.
-        existing = openai_api_key()
+        existing = speechify_api_key()
         hint = (existing[:7] + "…" + existing[-4:]) if len(existing) > 12 else existing
         with _foreground_app():
             win = rumps.Window(
-                title="OpenAI API key",
-                message="Paste your OpenAI API key (used for natural TTS). "
+                title="Speechify API key",
+                message="Paste your Speechify API key (used for natural TTS). "
                         f"Current: {hint or 'none'}",
                 default_text="",
                 ok="Save", cancel="Cancel",
@@ -1654,8 +1551,8 @@ class ScribeApp(rumps.App):
         if resp.clicked:
             new_key = resp.text.strip()
             if new_key:
-                save_openai_key(new_key)
-                rumps.notification("OpenAI key saved", "", "Stored securely (not in git).")
+                save_speechify_key(new_key)
+                rumps.notification("Speechify key saved", "", "Stored securely (not in git).")
 
     def on_read_selected_text(self, _sender) -> None:
         threading.Thread(target=self._read_selected_text, daemon=True).start()
@@ -1709,18 +1606,18 @@ class ScribeApp(rumps.App):
         self._speak_text(text)
 
     def _speak_text(self, text: str) -> None:
-        # Pick the backend by the persisted engine choice. If OpenAI is
+        # Pick the backend by the persisted engine choice. If Speechify is
         # selected but the key is missing, Edge reads instead, so Read aloud
         # still works.
-        use_openai = self.tts_engine == "openai"
-        if use_openai and not openai_api_key():
+        use_speechify = self.tts_engine == "speechify"
+        if use_speechify and not speechify_api_key():
             callAfter(lambda: rumps.notification(
-                "OpenAI key missing", "Falling back to Edge voice",
-                "Set it via 'Set OpenAI API key…'.",
+                "Speechify key missing", "Falling back to Edge voice",
+                "Set it via 'Set Speechify API key…'.",
             ))
-            use_openai = False
+            use_speechify = False
 
-        helper = OPENAI_TTS_STREAM if use_openai else EDGE_TTS_STREAM
+        helper = SPEECHIFY_TTS_STREAM if use_speechify else EDGE_TTS_STREAM
         if not helper.exists():
             callAfter(lambda: rumps.notification(
                 "Read aloud unavailable", "", f"Missing {helper}"
@@ -1730,26 +1627,21 @@ class ScribeApp(rumps.App):
         # Resolve the voice from the language of the text itself. Falls back
         # to the engine's default voice when auto-detect is off, the detector
         # is unsure, or that language has no voice mapped.
-        engine = "openai" if use_openai else "edge"
+        engine = "speechify" if use_speechify else "edge"
         voice, lang = resolve_tts_voice(engine, text)
         if lang:
             print(f"[tts] detected {lang} → {voice}", file=sys.stderr)
 
-        # Child inherits our env; for OpenAI pass the key + chosen voice so the
-        # helper needs no extra lookup. Voice/instructions also live in
+        # Child inherits our env; for Speechify pass the key + chosen voice so
+        # the helper needs no extra lookup. The voice also lives in
         # settings.json as a fallback for standalone use.
         env = os.environ.copy()
         cmd = [str(helper), "--stdin", "--voice", voice]
-        if use_openai:
-            key = openai_api_key()
+        if use_speechify:
+            key = speechify_api_key()
             if key:
-                env["OPENAI_API_KEY"] = key
-            # Speed/model explicit; instructions ride along in settings.json
-            # (mirrored on every save) to keep argv small.
-            cmd += [
-                "--speed", str(self.openai_speed),
-                "--model", self.openai_model,
-            ]
+                env["SPEECHIFY_API_KEY"] = key
+            cmd += ["--speed", str(self.speechify_speed)]
 
         # Replace any playback we already own before starting a new one.
         self._kill_tts_proc()
@@ -1798,7 +1690,7 @@ class ScribeApp(rumps.App):
     def _watch_tts_proc(self, proc: subprocess.Popen, engine: str) -> None:
         """Tell the user why a read-aloud produced no sound.
 
-        The helpers fall back on their own (OpenAI → Edge → the Mac's voice)
+        The helpers fall back on their own (Speechify → Edge → the Mac's voice)
         and exit 1 only when nothing could read the text. A Stop — ours or
         another helper's — kills them by signal, which shows up as a negative
         returncode and must stay quiet.
@@ -1861,7 +1753,7 @@ class ScribeApp(rumps.App):
         #    other than this app. Both helpers write the same file, so one
         #    --stop kills the active playback group, whichever engine it is.
         if TTS_PID_FILE.exists():
-            for helper in (EDGE_TTS_STREAM, OPENAI_TTS_STREAM):
+            for helper in (EDGE_TTS_STREAM, SPEECHIFY_TTS_STREAM):
                 if not helper.exists():
                     continue
                 stopped = True
@@ -1903,9 +1795,9 @@ class ScribeApp(rumps.App):
         # previews the voice English actually speaks with, not whatever
         # happens to be the default.
         sample = "Notice how warm and natural this sounds."
-        if self.tts_engine == "openai" and openai_api_key():
-            voice, _ = resolve_tts_voice("openai", sample)
-            self._speak_text(f"This is the {voice} voice. {sample}")
+        if self.tts_engine == "speechify" and speechify_api_key():
+            voice, _ = resolve_tts_voice("speechify", sample)
+            self._speak_text(f"This is {speechify_voice_name(voice)}. {sample}")
             return
         voice, _ = resolve_tts_voice("edge", sample)
         name = voice.split("-")[-1].replace("Neural", "")

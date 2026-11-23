@@ -7,7 +7,7 @@ three different consumers that must all agree on the answer —
 
   • scribe.py / scribe_core.py  (the menubar app's Read-aloud path)
   • edge-tts-stream            (standalone helper, ⌃D Quick Action path)
-  • openai-tts-stream          (standalone helper, ⌃D Quick Action path)
+  • speechify-tts-stream          (standalone helper, ⌃D Quick Action path)
 
 The helpers live in ~/bin and import this as a sibling module, so this file is
 deployed next to them. Keeping it importable from both places is why it has no
@@ -313,9 +313,7 @@ def voice_for_lang(mapping, lang, default, lang_defaults=None):
 
     Step 2 exists because step 3 alone gives the wrong result whenever the
     default belongs to some other language: Spanish text has no business being
-    read by a French voice just because French is the default. Engines whose
-    voices are language-neutral (OpenAI) pass no lang_defaults and go straight
-    from 1 to 3.
+    read by a French voice just because French is the default.
 
     Shared by the app and both helpers so the rule cannot drift.
     """

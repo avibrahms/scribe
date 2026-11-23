@@ -4,7 +4,7 @@
 
 Hold a modifier key anywhere on your computer, speak, release → the transcript pastes into whatever text field you're looking at. Miss the text field? Press `⌃⌘V` (macOS) or `Ctrl+Alt+V` (Windows) to paste the last transcript again. Every transcript is kept in a scrollable history you can copy from.
 
-No subscription, no account, no telemetry. The only thing that leaves your computer is a ~3-second audio clip sent to Groq's free Whisper API, and an optional TTS text string sent to the read-aloud engine you pick (Microsoft Edge's free endpoint, or OpenAI).
+No subscription, no account, no telemetry. The only thing that leaves your computer is a ~3-second audio clip sent to Groq's free Whisper API, and an optional TTS text string sent to the read-aloud engine you pick (Microsoft Edge's free endpoint, or Speechify).
 
 **Supported:** macOS 12+ · Windows 10+
 
@@ -18,7 +18,7 @@ Wispr Flow is great, but it's **$12/month**, proprietary, and sends your audio a
 | Auto-pastes into focused field | ✓ | ✓ |
 | Transcript history | ✓ | ✓ |
 | Multi-language dictation | ✓ | ✓ (Whisper-large-v3-turbo) |
-| TTS read-aloud | ✗ | ✓ (OpenAI or Microsoft Edge voices) |
+| TTS read-aloud | ✗ | ✓ (Speechify or Microsoft Edge voices) |
 | Per-language TTS voice | ✗ | ✓ (auto-detected, offline) |
 | Clipboard preserved during paste | — | ✓ (macOS: full; Windows: text) |
 | Open source | ✗ | ✓ (MIT) |
@@ -29,14 +29,14 @@ Wispr Flow is great, but it's **$12/month**, proprietary, and sends your audio a
 - **STT (dictation)**: hold a modifier key (default: Right ⌥/Alt) → record via `sounddevice` → send WAV to **Groq's free Whisper API** (`whisper-large-v3-turbo`) → snapshot the clipboard → paste the transcript → restore your clipboard.
 - **Claude / cloud**: before saving or pasting, a local correction prefers **Claude** for ambiguous singular “cloud,” including “cloud code” → “Claude code.” Common cloud computing/weather phrases (such as “cloud storage,” “Google Cloud,” and “a cloud”) and addresses stay intact. Say **“literal cloud”** to force “cloud”; “literal” is removed. These lightweight English context rules add no API calls and cannot resolve every homophone perfectly.
 - **TTS (read-aloud)**: any selected text → choose your engine from the menu (**TTS Engine**):
-  - **OpenAI** — `gpt-4o-mini-tts`: very natural, emotionally expressive voices (Coral, Nova, Shimmer, Sage, Ash, Onyx, Fable, …). Needs an OpenAI API key (set it via *Set OpenAI API key…*); costs ~$0.015/min.
+  - **Speechify** — `simba-3.5`: very natural voices, native to each language (Harper, Wyatt, Beatrice, Isabelle, Romain, …). Needs a Speechify API key (create one at platform.speechify.ai, set it via *Set Speechify API key…*); the free plan covers 333K characters a month and pauses until the next month once they are used.
   - **Microsoft Edge** (default) — free, unlimited Edge neural voices (Ava, Andrew, Brian, Emma, William, Sonia, Natasha, Denise, Elvira, Katja, Elsa, etc.), no API key.
 
   The engine and per-engine voice are remembered across relaunch. Keys are stored only in the gitignored `.env` and a `0600` file under `~/.config/speak-selection/` — never committed.
-- **Per-language voices**: the language of the text is detected before it is spoken, and each language uses the voice you picked for it — Henri for French, William for English, and so on, per engine. Set them under *Voice* in either engine's tuning menu: pick a voice inside a language's submenu and the ✓ stays there. A language you never pick still gets its own default voice, so every language submenu always shows a ✓ on the voice it will actually use — on Edge that is a voice of the matching locale (Spanish text is read by a Spanish voice, never by whatever the global default happens to be), and on OpenAI, whose voices all speak every language, it is a distinct voice per language dealt from the catalogue. Only genuinely unidentifiable text falls through to *Default — when language is unclear*, and *Auto-detect language* turns the whole thing off.
+- **Per-language voices**: the language of the text is detected before it is spoken, and each language uses the voice you picked for it — Henri for French, William for English, and so on, per engine. Set them under *Voice* in either engine's tuning menu: pick a voice inside a language's submenu and the ✓ stays there. A language you never pick still gets its own default voice, so every language submenu always shows a ✓ on the voice it will actually use — on Edge that is a voice of the matching locale (Spanish text is read by a Spanish voice, never by whatever the global default happens to be), and on Speechify it is Speechify's first pick for that language. Only genuinely unidentifiable text falls through to *Default — when language is unclear*, and *Auto-detect language* turns the whole thing off.
 
   Detection is offline and dependency-free (`bin/tts_lang.py`) — no text is sent anywhere to identify it. It covers the languages Scribe ships voices for (English, French, Spanish, German, Italian) and deliberately answers "unsure" rather than guessing, in which case the default voice is used. The app and the standalone ⌃D/⌃X helpers share the one detector, so both pick the same voice for the same text. macOS only for now — the Windows tray app keeps the single-voice behaviour.
-- **Read aloud never goes silent**: when an engine can't speak, the next one takes over and a notification says why. OpenAI (no key, no credits, no network) hands the unread text to Edge. Edge tries every Microsoft endpoint, starting with the last one that worked; if Microsoft refuses them all (it changes its protocol every few months), the helper upgrades its own `edge-tts` — at most once an hour — and tries again. When even that fails, the Mac's built-in voice reads the text, in the text's language (`bin/tts_fallback.py`, macOS only). A *Read aloud failed* notification only appears when nothing at all could speak.
+- **Read aloud never goes silent**: when an engine can't speak, the next one takes over and a notification says why. Speechify (no key, the month's free characters used up, no network) hands the unread text to Edge. Edge tries every Microsoft endpoint, starting with the last one that worked; if Microsoft refuses them all (it changes its protocol every few months), the helper upgrades its own `edge-tts` — at most once an hour — and tries again. When even that fails, the Mac's built-in voice reads the text, in the text's language (`bin/tts_fallback.py`, macOS only). A *Read aloud failed* notification only appears when nothing at all could speak.
 - **No stops in the middle of a word**: about one connection in thirty to Microsoft lands on a slow server that sends audio slower than the voice speaks. The Edge helper therefore cuts the text into groups of whole sentences, fetches two of them at a time ahead of the voice, and gives the player a group only once all of it has arrived: the voice can pause between two sentences, never inside a word. A connection that is slow to start or to finish is raced by a fresh one. Each read leaves one line in `~/.config/speak-selection/read-aloud.log` (time to first sound, pauses, raced and failed connections). `python3 tools/test_tts_buffer.py` covers the cutting, the order and the race.
 - **A quick start**: loading the Edge library takes the helper 0.2 s, so each read leaves one standby process behind that has it loaded and reads the next text. It is replaced after each read, uses about 50 MB, and exits after 10 minutes without a read; the next read then loads the library itself.
 - **Stop only stops a read**: ⌃S is seen in every app, so Stop first looks whether anything is being read and stays silent otherwise. The file that names the read in progress is checked against the running processes before anything is killed, so a leftover one can never stop another program.
@@ -55,7 +55,7 @@ bin/tts_proc.py           — one read at a time: the stop logic shared by the h
 bin/tts_fallback.py       — fallbacks shared by the helpers (Mac voice, notifications)
 bin/tts_text.py           — text preparation shared by the helpers (tables, symbols, units)
 bin/edge-tts-stream       — standalone Edge TTS helper (⌃D / ⌃X Quick Actions)
-bin/openai-tts-stream     — standalone OpenAI TTS helper
+bin/speechify-tts-stream  — standalone Speechify TTS helper
 bin/speak-selection.sh    — routes the Quick Actions to the selected engine
 setup.py                  — macOS .app build recipe (py2app)
 install.sh                — macOS installer
@@ -141,7 +141,7 @@ Windows has no TCC/permissions system to grant — Scribe just works. Caveats:
 - **Change dictation language**: tray menu → *Dictation Language*.
 - **Choose the microphone** (macOS): menu → *Microphone*. The choice is kept even when macOS makes a reconnecting Bluetooth headset the default input again; *System default* follows macOS. A Bluetooth mic needs a moment to wake up, so wait for 🔴 before speaking, and Scribe keeps listening 0.4s after you release the key to catch the words still on their way. Built-in and USB mics get neither delay.
 - **Speak text aloud**: tray menu → *Test Voice*, *Read selected text* or *Read copied text*. On macOS, ⌃D (selection), ⌃X (clipboard) and ⌃S (stop) are Quick Actions installed by `install-read-aloud.sh`; give them their shortcuts once in System Settings → Keyboard → Keyboard Shortcuts → Services.
-- **Set a voice per language**: tray menu → *OpenAI TTS — tuning* or *Microsoft Edge TTS — tuning* → *Voice* → pick a voice inside a language's submenu.
+- **Set a voice per language**: tray menu → *Speechify TTS — tuning* or *Microsoft Edge TTS — tuning* → *Voice* → pick a voice inside a language's submenu.
 - **Browse history**: tray menu → *History*. Click any entry to copy it.
 
 ## File locations
@@ -155,7 +155,7 @@ Windows has no TCC/permissions system to grant — Scribe just works. Caveats:
 ## Privacy
 
 - Audio: sent to `api.groq.com` for transcription. Groq's policy is on [their site](https://groq.com/privacy-policy/).
-- TTS text: sent to the selected engine — Microsoft's Edge read-aloud endpoint (free) or OpenAI's `api.openai.com` (when the OpenAI engine is selected).
+- TTS text: sent to the selected engine — Microsoft's Edge read-aloud endpoint (free) or Speechify's `api.speechify.ai` (when the Speechify engine is selected).
 - TTS language detection runs entirely on your machine (`bin/tts_lang.py`, no dependencies, no network) — text is never sent anywhere just to identify its language.
 - Nothing else leaves your machine. No analytics, no crash reporting, no phone-home.
 - Transcript history is stored locally as plain JSON Lines — easy to grep or delete.

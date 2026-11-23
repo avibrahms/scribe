@@ -13,7 +13,7 @@ import sys
 import threading
 import time
 
-# Shared with openai-tts-stream, deployed alongside: only one read runs at a
+# Shared with speechify-tts-stream, deployed alongside: only one read runs at a
 # time, whichever helper started it.
 from tts_proc import CONFIG_DIR, claim, release, stop_existing
 

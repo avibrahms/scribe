@@ -326,55 +326,67 @@ def save_voice(voice: str) -> None:
         pass
 
 
-# ---------- TTS engine selection (Edge vs OpenAI) ------------------------
+# ---------- TTS engine selection (Edge vs Speechify) ---------------------
 # Two backends, switchable from the menu, choice persisted across relaunch.
-#   • "edge"   — free Microsoft Edge neural voices (no key, see VOICES)
-#   • "openai" — gpt-4o-mini-tts, natural + steerable emotion (needs a key)
+#   • "edge"      — free Microsoft Edge neural voices (no key, see VOICES)
+#   • "speechify" — simba-3.5, the most natural voices (needs a key; the free
+#                   plan covers 333K characters a month)
 
-TTS_ENGINES = ("openai", "edge")
+TTS_ENGINES = ("speechify", "edge")
 DEFAULT_TTS_ENGINE = "edge"
 
-OPENAI_TTS_MODEL = "gpt-4o-mini-tts"
-DEFAULT_OPENAI_VOICE = "coral"
-DEFAULT_TTS_INSTRUCTIONS = (
-    "Perform this text aloud like an expressive human storyteller — never a "
-    "narrator droning through a script. Constantly vary your pitch, pace, and "
-    "volume: rise with excitement, slow down and lower your voice for emphasis "
-    "or suspense, lift the ends of questions, and let energy build and release "
-    "across sentences. Use clear emotional ups and downs that match the meaning "
-    "of the words — warmth, curiosity, surprise, enthusiasm. Add natural human "
-    "rhythm with small pauses for breath and thought. Absolutely avoid a flat, "
-    "monotone, robotic, or detached delivery; every sentence should sound alive "
-    "and genuinely felt."
-)
+SPEECHIFY_TTS_MODEL = "simba-3.5"
+DEFAULT_SPEECHIFY_VOICE = "harper_32"
 
-# Curated gpt-4o-mini-tts voices (label, id). All support emotion steering.
-OPENAI_VOICES: list[tuple[str, str]] = [
-    ("Coral · warm, expressive",  "coral"),
-    ("Nova · bright female",      "nova"),
-    ("Shimmer · soft female",     "shimmer"),
-    ("Sage · calm female",        "sage"),
-    ("Alloy · neutral",           "alloy"),
-    ("Ash · natural male",        "ash"),
-    ("Ballad · gentle male",      "ballad"),
-    ("Echo · clear male",         "echo"),
-    ("Onyx · deep male",          "onyx"),
-    ("Fable · storyteller",       "fable"),
+# Speechify's own picks per language: (menu title, language, [(label, id)]).
+# Every voice can speak every language, with the accent of its recording, so
+# each language lists the voices native to it.
+SPEECHIFY_VOICES: list[tuple[str, str, list[tuple[str, str]]]] = [
+    ("English (US)", "en", [
+        ("Harper · US female",   "harper_32"),
+        ("Wyatt · US male",      "wyatt_32"),
+        ("Geffen · US female",   "geffen_32"),
+        ("Dominic · US male",    "dominic_32"),
+        ("George · US male",     "george"),
+        ("Henry · US male",      "henry"),
+        ("Carly · US female",    "carly"),
+        ("Oliver · US male",     "oliver"),
+    ]),
+    ("English (UK)", "en", [
+        ("Beatrice · UK female", "beatrice_32"),
+        ("Imogen · UK female",   "imogen_32"),
+        ("Edmund · UK male",     "edmund_32"),
+        ("Hugh · UK male",       "hugh_32"),
+    ]),
+    ("French", "fr", [
+        ("Isabelle · France female", "isabelle-agent"),
+        ("Romain · France male",     "romain-agent"),
+        ("Augustin · France male",   "augustin-agent"),
+    ]),
+    ("Spanish", "es", [
+        ("Vega · ES female",     "vega"),
+        ("Guille · ES male",     "guille"),
+        ("Unai · ES male",       "unai"),
+        ("Inés · ES female",     "iness"),
+        ("Lola · ES female",     "lola"),
+    ]),
+    ("German", "de", [
+        ("Henrik · DE male",     "henrik-agent"),
+        ("Runa · DE female",     "runa-agent"),
+        ("Benedikt · DE male",   "benedikt-agent"),
+    ]),
+    ("Italian", "it", [
+        ("Benedetta · IT female", "benedetta-agent"),
+        ("Daniele · IT male",     "daniele-agent"),
+        ("Rosanna · IT female",   "rosanna"),
+        ("Stefano · IT male",     "stefano-agent"),
+        ("Vittoria · IT female",  "vittoria"),
+    ]),
 ]
 
-# OpenAI models. Only gpt-4o-mini-tts honours `instructions` (emotion
-# steering); tts-1 / tts-1-hd ignore it but all three honour `speed`.
-DEFAULT_OPENAI_MODEL = OPENAI_TTS_MODEL  # "gpt-4o-mini-tts"
-OPENAI_MODELS: list[tuple[str, str]] = [
-    ("gpt-4o-mini-tts · steerable emotion", "gpt-4o-mini-tts"),
-    ("tts-1 · fast, no emotion steering",   "tts-1"),
-    ("tts-1-hd · higher fidelity",          "tts-1-hd"),
-]
-OPENAI_MODEL_IDS = {m for _, m in OPENAI_MODELS}
-
-# Playback speed multiplier accepted by the speech endpoint.
-DEFAULT_OPENAI_SPEED = 1.0
-OPENAI_SPEED_MIN, OPENAI_SPEED_MAX = 0.25, 4.0
+# Speed multiplier, sent as an SSML prosody rate (which starts at -50%).
+DEFAULT_SPEECHIFY_SPEED = 1.0
+SPEECHIFY_SPEED_MIN, SPEECHIFY_SPEED_MAX = 0.5, 4.0
 
 # Edge prosody (SSML-style strings edge-tts accepts verbatim).
 DEFAULT_EDGE_RATE = "+0%"
@@ -407,68 +419,48 @@ def save_tts_engine(engine: str) -> None:
     _write_speak_settings(engine=engine)
 
 
-def load_openai_voice() -> str:
+def load_speechify_voice() -> str:
     cfg = load_cfg()
-    v = str(cfg.get("openai_voice", "")).strip()
-    return v or DEFAULT_OPENAI_VOICE
+    v = str(cfg.get("speechify_voice", "")).strip()
+    return v or DEFAULT_SPEECHIFY_VOICE
 
 
-def save_openai_voice(voice: str) -> None:
+def save_speechify_voice(voice: str) -> None:
     voice = voice.strip()
     if not voice:
         return
     cfg = load_cfg()
-    cfg["openai_voice"] = voice
+    cfg["speechify_voice"] = voice
     save_cfg(cfg)
-    _write_speak_settings(openai_voice=voice)
+    _write_speak_settings(speechify_voice=voice)
 
 
-def load_tts_instructions() -> str:
-    cfg = load_cfg()
-    v = str(cfg.get("openai_instructions", "")).strip()
-    return v or DEFAULT_TTS_INSTRUCTIONS
+def speechify_voice_name(voice_id: str) -> str:
+    """'harper_32' -> 'Harper', as the menu names it."""
+    for _title, _lang, voices in SPEECHIFY_VOICES:
+        for label, vid in voices:
+            if vid == voice_id:
+                return label.split(" · ")[0]
+    return voice_id
 
 
-def save_tts_instructions(text: str) -> None:
-    text = text.strip() or DEFAULT_TTS_INSTRUCTIONS
-    cfg = load_cfg()
-    cfg["openai_instructions"] = text
-    save_cfg(cfg)
-    _write_speak_settings(openai_instructions=text)
-
-
-def load_openai_model() -> str:
-    m = str(load_cfg().get("openai_model", "")).strip()
-    return m if m in OPENAI_MODEL_IDS else DEFAULT_OPENAI_MODEL
-
-
-def save_openai_model(model: str) -> None:
-    model = model.strip()
-    if model not in OPENAI_MODEL_IDS:
-        return
-    cfg = load_cfg()
-    cfg["openai_model"] = model
-    save_cfg(cfg)
-    _write_speak_settings(openai_model=model)
-
-
-def load_openai_speed() -> float:
+def load_speechify_speed() -> float:
     try:
-        s = float(load_cfg().get("openai_speed", DEFAULT_OPENAI_SPEED))
+        s = float(load_cfg().get("speechify_speed", DEFAULT_SPEECHIFY_SPEED))
     except (TypeError, ValueError):
-        return DEFAULT_OPENAI_SPEED
-    return min(OPENAI_SPEED_MAX, max(OPENAI_SPEED_MIN, s))
+        return DEFAULT_SPEECHIFY_SPEED
+    return min(SPEECHIFY_SPEED_MAX, max(SPEECHIFY_SPEED_MIN, s))
 
 
-def save_openai_speed(speed: float) -> None:
+def save_speechify_speed(speed: float) -> None:
     try:
-        s = min(OPENAI_SPEED_MAX, max(OPENAI_SPEED_MIN, float(speed)))
+        s = min(SPEECHIFY_SPEED_MAX, max(SPEECHIFY_SPEED_MIN, float(speed)))
     except (TypeError, ValueError):
         return
     cfg = load_cfg()
-    cfg["openai_speed"] = s
+    cfg["speechify_speed"] = s
     save_cfg(cfg)
-    _write_speak_settings(openai_speed=s)
+    _write_speak_settings(speechify_speed=s)
 
 
 # ---------- Edge prosody (rate / pitch / volume) -------------------------
@@ -593,8 +585,8 @@ def load_edge_voice_map() -> dict[str, str]:
     return _load_voice_map("edge_voice_by_lang")
 
 
-def load_openai_voice_map() -> dict[str, str]:
-    return _load_voice_map("openai_voice_by_lang")
+def load_speechify_voice_map() -> dict[str, str]:
+    return _load_voice_map("speechify_voice_by_lang")
 
 
 def _save_voice_for_lang(key: str, lang: str, voice: str) -> dict[str, str]:
@@ -615,8 +607,8 @@ def save_edge_voice_for_lang(lang: str, voice: str) -> dict[str, str]:
     return _save_voice_for_lang("edge_voice_by_lang", lang, voice)
 
 
-def save_openai_voice_for_lang(lang: str, voice: str) -> dict[str, str]:
-    return _save_voice_for_lang("openai_voice_by_lang", lang, voice)
+def save_speechify_voice_for_lang(lang: str, voice: str) -> dict[str, str]:
+    return _save_voice_for_lang("speechify_voice_by_lang", lang, voice)
 
 
 def edge_lang_defaults() -> dict[str, str]:
@@ -637,25 +629,29 @@ def edge_lang_defaults() -> dict[str, str]:
     return out
 
 
-def openai_lang_defaults() -> dict[str, str]:
-    """{language: a distinct OpenAI voice}, dealt from OPENAI_VOICES in order.
+def speechify_lang_defaults() -> dict[str, str]:
+    """{language: Speechify's first pick for it}, derived from
+    SPEECHIFY_VOICES, so a language never falls back to a voice with another
+    language's accent."""
+    out: dict[str, str] = {}
+    for _title, lang, voices in SPEECHIFY_VOICES:
+        if lang in TTS_LANGS and voices:
+            out.setdefault(lang, voices[0][1])
+    return out
 
-    Unlike Edge, OpenAI's voices carry no locale — every one of them speaks
-    every supported language — so there is no linguistically correct mapping
-    to derive. What matters is that each language starts with its own stable,
-    distinct, overridable default the menu can show. Dealing from the
-    catalogue in order keeps even that derived: a language added to
-    TTS_LANGS picks up the next voice with no table to update.
-    """
-    voices = [voice_id for _label, voice_id in OPENAI_VOICES]
-    if not voices:
-        return {}
-    return {lang: voices[i % len(voices)] for i, lang in enumerate(TTS_LANGS)}
+
+def speechify_voice_langs() -> dict[str, str]:
+    """{voice id: its own language}, derived from SPEECHIFY_VOICES. The helper
+    names the language to Speechify only when a voice reads another one."""
+    return {voice_id: lang
+            for _title, lang, voices in SPEECHIFY_VOICES
+            for _label, voice_id in voices}
 
 
 def lang_defaults_for(engine: str) -> dict[str, str]:
     """Per-language default voices for the engine."""
-    return openai_lang_defaults() if engine == "openai" else edge_lang_defaults()
+    return (speechify_lang_defaults() if engine == "speechify"
+            else edge_lang_defaults())
 
 
 def effective_tts_voice(engine: str, lang: str | None) -> str:
@@ -664,8 +660,9 @@ def effective_tts_voice(engine: str, lang: str | None) -> str:
     Shared by the resolver and the menu so a check mark can never disagree
     with what is about to come out of the speakers.
     """
-    default = load_openai_voice() if engine == "openai" else load_voice()
-    mapping = load_openai_voice_map() if engine == "openai" else load_edge_voice_map()
+    speechify = engine == "speechify"
+    default = load_speechify_voice() if speechify else load_voice()
+    mapping = load_speechify_voice_map() if speechify else load_edge_voice_map()
     if tts_lang:
         return tts_lang.voice_for_lang(mapping, lang, default, lang_defaults_for(engine))
     if not lang:
@@ -684,20 +681,42 @@ def sync_speak_settings() -> None:
     """
     if not load_cfg().get("edge_voice"):
         save_voice(load_voice())  # from where it was kept before config.json
+    _drop_openai_settings()
     _write_speak_settings(
         engine=load_tts_engine(),
         voice=load_voice(),
         rate=load_edge_rate(),
         pitch=load_edge_pitch(),
         volume=load_edge_volume(),
-        openai_voice=load_openai_voice(),
-        openai_instructions=load_tts_instructions(),
-        openai_model=load_openai_model(),
-        openai_speed=load_openai_speed(),
+        speechify_voice=load_speechify_voice(),
+        speechify_speed=load_speechify_speed(),
         tts_autodetect=load_tts_autodetect(),
         edge_voice_by_lang=load_edge_voice_map(),
-        openai_voice_by_lang=load_openai_voice_map(),
+        speechify_voice_by_lang=load_speechify_voice_map(),
     )
+
+
+def _drop_openai_settings() -> None:
+    """Remove what the OpenAI engine, replaced by Speechify, left in both
+    stores. The speed chosen there is kept as the Speechify speed."""
+    cfg = load_cfg()
+    stale = [k for k in cfg if k.startswith("openai_")]
+    if stale:
+        if "speechify_speed" not in cfg and "openai_speed" in cfg:
+            cfg["speechify_speed"] = cfg["openai_speed"]
+        for k in stale:
+            del cfg[k]
+        save_cfg(cfg)
+    try:
+        mirror = json.loads(SETTINGS_FILE.read_text())
+    except Exception:
+        return
+    kept = {k: v for k, v in mirror.items() if not k.startswith("openai_")}
+    if len(kept) != len(mirror):
+        try:
+            SETTINGS_FILE.write_text(json.dumps(kept, indent=2))
+        except Exception:
+            pass
 
 
 def resolve_tts_voice(engine: str, text: str) -> tuple[str, str | None]:
@@ -723,14 +742,13 @@ def _write_speak_settings(**fields) -> None:
         except Exception:
             settings = {}
     # Ensure the helper always has sane values present.
-    settings.setdefault("openai_voice", DEFAULT_OPENAI_VOICE)
-    settings.setdefault("openai_instructions", DEFAULT_TTS_INSTRUCTIONS)
-    settings.setdefault("openai_model", OPENAI_TTS_MODEL)
-    # Always refreshed rather than defaulted: both are derived from the voice
-    # catalogues, so they must follow VOICES / OPENAI_VOICES rather than
+    settings.setdefault("speechify_voice", DEFAULT_SPEECHIFY_VOICE)
+    # Always refreshed rather than defaulted: these are derived from the voice
+    # catalogues, so they must follow VOICES / SPEECHIFY_VOICES rather than
     # whatever was written to disk by an older build.
     settings["edge_lang_defaults"] = edge_lang_defaults()
-    settings["openai_lang_defaults"] = openai_lang_defaults()
+    settings["speechify_lang_defaults"] = speechify_lang_defaults()
+    settings["speechify_voice_langs"] = speechify_voice_langs()
     for k, v in fields.items():
         if v is not None:
             settings[k] = v
@@ -740,24 +758,24 @@ def _write_speak_settings(**fields) -> None:
         pass
 
 
-def openai_api_key() -> str:
-    k = (os.environ.get("OPENAI_API_KEY") or "").strip()
+def speechify_api_key() -> str:
+    k = (os.environ.get("SPEECHIFY_API_KEY") or "").strip()
     if k:
         return k
     # Standalone key file (0600), shared with the helper.
     try:
-        kf = SPEAK_SELECTION_DIR / "openai_key"
+        kf = SPEAK_SELECTION_DIR / "speechify_key"
         if kf.exists():
             return kf.read_text().strip()
     except Exception:
         pass
-    cfg = load_cfg()
-    return str(cfg.get("openai_api_key", "")).strip()
+    return ""
 
 
-def save_openai_key(key: str) -> None:
-    """Persist the OpenAI key OUT of the repo: the app's gitignored .env (so
-    the running app inherits it via env) plus a 0600 key file for the helper."""
+def save_speechify_key(key: str) -> None:
+    """Persist the Speechify key OUT of the repo: the app's gitignored .env
+    (so the running app inherits it via env) plus a 0600 key file for the
+    helper."""
     key = key.strip()
     if not key:
         return
@@ -765,13 +783,13 @@ def save_openai_key(key: str) -> None:
     existing = DOTENV_FILE.read_text().splitlines() if DOTENV_FILE.exists() else []
     out, replaced = [], False
     for line in existing:
-        if line.strip().startswith("OPENAI_API_KEY="):
-            out.append(f"OPENAI_API_KEY={key}")
+        if line.strip().startswith("SPEECHIFY_API_KEY="):
+            out.append(f"SPEECHIFY_API_KEY={key}")
             replaced = True
         else:
             out.append(line)
     if not replaced:
-        out.append(f"OPENAI_API_KEY={key}")
+        out.append(f"SPEECHIFY_API_KEY={key}")
     DOTENV_FILE.write_text("\n".join(out) + "\n")
     try:
         os.chmod(DOTENV_FILE, 0o600)
@@ -779,13 +797,13 @@ def save_openai_key(key: str) -> None:
         pass
     # 0600 standalone key file.
     try:
-        kf = SPEAK_SELECTION_DIR / "openai_key"
+        kf = SPEAK_SELECTION_DIR / "speechify_key"
         kf.write_text(key)
         os.chmod(kf, 0o600)
     except Exception:
         pass
     # Make it live in this process immediately.
-    os.environ["OPENAI_API_KEY"] = key
+    os.environ["SPEECHIFY_API_KEY"] = key
 
 
 # ---------- audio recorder ------------------------------------------------

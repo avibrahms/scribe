@@ -45,6 +45,35 @@ class VoiceStoreTest(unittest.TestCase):
         self.assertEqual(core.load_voice(), "en-AU-WilliamNeural")
         self.assertFalse(core.VOICE_CONFIG_FILE.exists())
 
+    def test_speechify_settings_reach_the_helpers(self):
+        core.save_speechify_voice("wyatt_32")
+        core.save_speechify_speed(1.25)
+        core.save_speechify_voice_for_lang("fr", "romain-agent")
+        mirror = json.loads(core.SETTINGS_FILE.read_text())
+        self.assertEqual(mirror["speechify_voice"], "wyatt_32")
+        self.assertEqual(mirror["speechify_speed"], 1.25)
+        self.assertEqual(mirror["speechify_voice_by_lang"], {"fr": "romain-agent"})
+        self.assertEqual(mirror["speechify_voice_langs"]["romain-agent"], "fr")
+        self.assertEqual(core.effective_tts_voice("speechify", "fr"), "romain-agent")
+        # A language never picked speaks with a voice native to it.
+        self.assertEqual(core.effective_tts_voice("speechify", "de"), "henrik-agent")
+        self.assertEqual(core.effective_tts_voice("speechify", None), "wyatt_32")
+
+    def test_openai_settings_are_dropped_and_the_speed_kept(self):
+        core.CONFIG_FILE.write_text(json.dumps(
+            {"edge_voice": "fr-FR-HenriNeural", "tts_engine": "openai",
+             "openai_voice": "fable", "openai_speed": 1.25}))
+        core.SETTINGS_FILE.write_text(json.dumps(
+            {"voice": "fr-FR-HenriNeural", "openai_voice": "fable",
+             "openai_voice_by_lang": {"en": "ash"}}))
+        core.sync_speak_settings()
+        cfg = json.loads(core.CONFIG_FILE.read_text())
+        mirror = json.loads(core.SETTINGS_FILE.read_text())
+        self.assertFalse([k for k in list(cfg) + list(mirror) if "openai" in k])
+        self.assertEqual(mirror["speechify_speed"], 1.25)
+        self.assertEqual(mirror["engine"], "edge")
+        self.assertEqual(mirror["voice"], "fr-FR-HenriNeural")
+
 
 if __name__ == "__main__":
     unittest.main()
