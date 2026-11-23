@@ -790,43 +790,61 @@ def _resolve_pauses(text):
 
 # --- Hard-wrapped text ----------------------------------------------------------
 
-_SENTENCE_END = re.compile(r"[.!?:;…][\"'”’»)\]]*$")
+_RE_LINE_SEPARATOR = re.compile("\r\n?|[\x0b\x0c\x85  ]")
+_CLOSERS = "\"'”’»)]"
+_OPENERS = "\"'“‘«(["
 _RE_LEADING_MARKER = re.compile(r"^(?:#{1,6}\s+|[\-\*]\s+|\d+\.\s+)")
 
 
 def _unwrap_lines(text):
     """Join lines that were cut only because the page was narrow.
 
-    Text copied from a PDF carries a line break at the end of every visual
-    line, and the voice pauses on each one, mid-sentence. A break is a wrap,
-    and becomes a space, when the sentence visibly carries on: the next line
-    starts with a lowercase letter, or the line was full (the next word did
-    not fit) and the next line continues or closes the sentence. Blank
-    lines, list items, headings and table rows keep their breaks."""
-    lines = text.split('\n')
+    Text selected or copied in a PDF carries a line break at the end of
+    every visual line, and the voice pauses on each one, mid-sentence. A
+    break is a wrap, and becomes a space, when the sentence visibly carries
+    on: the next line starts in lowercase or with a bracket, or the line
+    was full (the next word did not fit beside its neighbours' width) and
+    what follows reads as the rest of the sentence. Blank lines, list
+    items, headings and table rows keep their breaks."""
+    lines = _RE_LINE_SEPARATOR.sub('\n', text).split('\n')
     if len(lines) < 2:
-        return text
-    width = max(len(line.rstrip()) for line in lines)
+        return '\n'.join(lines)
+    lengths = [len(line.strip()) for line in lines]
     out = [lines[0]]
-    for prev, line in zip(lines, lines[1:]):
+    for i in range(1, len(lines)):
+        prev, line = lines[i - 1], lines[i]
         a, b = prev.rstrip(), line.strip()
         body = _RE_LEADING_MARKER.sub('', a.lstrip())
-        if (not body or not b or _SENTENCE_END.search(a)
+        if (not body or not b
                 or _RE_STRUCTURAL_LINE.match(line)
                 or '|' in a or '\t' in a or '|' in b or '\t' in line
                 or BREAK in a or BREAK in b):
             out.append(line)
             continue
-        first = b.split()[0]
-        full = len(a) + 1 + len(first) > 0.85 * width and width >= 40
-        if b[0].islower():
-            wrapped = full or len(body.split()) >= 3
-        elif b[0].isupper() or b[0] in "\"'“‘«(":
+        # The page width here: the longest line nearby (columns, footers
+        # and small print elsewhere have their own).
+        width = max(lengths[max(0, i - 6):i + 5])
+        full = (width >= 40
+                and lengths[i - 1] + 1 + len(b.split()[0]) > 0.85 * width)
+        words = len(body.split())
+        end = a.rstrip(_CLOSERS)[-1:]
+        start = b.lstrip(_OPENERS)[:1]
+        closes = b.rstrip(_CLOSERS)[-1:] in ".!?…;:,"
+        if end in ".!?…":
+            # A sentence ended: only an abbreviation at the margin goes on
+            wrapped = full and start.islower() and b[0] not in _OPENERS
+        elif start.islower() or b[0] in "([":
+            wrapped = full or words >= 3
+        elif start.isdigit():
+            # "… by up to / 6 weeks", not a heading over its figure
+            wrapped = full or (words >= 3 and body[-1].islower()
+                               and not _RE_STRUCTURAL_LINE.match(prev)
+                               and any(c.isalpha() for c in b))
+        elif start.isupper():
             # A capital may open a new item: join only when the line was
             # full and the next one reads as the rest of a sentence.
-            wrapped = full and bool(
-                _SENTENCE_END.search(b)
-                or len(b) > 0.7 * width)
+            wrapped = full and (closes or end in ",;"
+                                or lengths[i] > 0.7 * width)
         else:
             wrapped = False
         if not wrapped:
@@ -864,7 +882,7 @@ def clean_text_for_speech(text, lang="en", breaks=False):
     """
     # Lines cut by a narrow page (PDF copies) back into sentences, before
     # anything reads a line edge as a pause
-    text = _unwrap_lines(text.replace('\r\n', '\n'))
+    text = _unwrap_lines(text)
     # ASCII arrows first: the HTML-tag pass would eat "<- a ->" as a tag.
     text = _RE_ASCII_ARROW.sub(PAUSE, text)
     # Tables — before pipe characters get turned into pauses, and before
