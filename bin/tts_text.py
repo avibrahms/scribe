@@ -788,6 +788,56 @@ def _resolve_pauses(text):
     return _RE_PAUSE_RUN.sub(repl, text)
 
 
+# --- Hard-wrapped text ----------------------------------------------------------
+
+_SENTENCE_END = re.compile(r"[.!?:;…][\"'”’»)\]]*$")
+_RE_LEADING_MARKER = re.compile(r"^(?:#{1,6}\s+|[\-\*]\s+|\d+\.\s+)")
+
+
+def _unwrap_lines(text):
+    """Join lines that were cut only because the page was narrow.
+
+    Text copied from a PDF carries a line break at the end of every visual
+    line, and the voice pauses on each one, mid-sentence. A break is a wrap,
+    and becomes a space, when the sentence visibly carries on: the next line
+    starts with a lowercase letter, or the line was full (the next word did
+    not fit) and the next line continues or closes the sentence. Blank
+    lines, list items, headings and table rows keep their breaks."""
+    lines = text.split('\n')
+    if len(lines) < 2:
+        return text
+    width = max(len(line.rstrip()) for line in lines)
+    out = [lines[0]]
+    for prev, line in zip(lines, lines[1:]):
+        a, b = prev.rstrip(), line.strip()
+        body = _RE_LEADING_MARKER.sub('', a.lstrip())
+        if (not body or not b or _SENTENCE_END.search(a)
+                or _RE_STRUCTURAL_LINE.match(line)
+                or '|' in a or '\t' in a or '|' in b or '\t' in line
+                or BREAK in a or BREAK in b):
+            out.append(line)
+            continue
+        first = b.split()[0]
+        full = len(a) + 1 + len(first) > 0.85 * width and width >= 40
+        if b[0].islower():
+            wrapped = full or len(body.split()) >= 3
+        elif b[0].isupper() or b[0] in "\"'“‘«(":
+            # A capital may open a new item: join only when the line was
+            # full and the next one reads as the rest of a sentence.
+            wrapped = full and bool(
+                _SENTENCE_END.search(b)
+                or len(b) > 0.7 * width)
+        else:
+            wrapped = False
+        if not wrapped:
+            out.append(line)
+        elif re.search(r"\w-$", a) and b[0].islower():
+            out[-1] = out[-1].rstrip() + b       # "full-\ntext"
+        else:
+            out[-1] = out[-1].rstrip() + ' ' + b
+    return '\n'.join(out)
+
+
 # --- Entry point ----------------------------------------------------------------
 
 def split_breaks(text):
@@ -812,6 +862,9 @@ def clean_text_for_speech(text, lang="en", breaks=False):
     see speech_lang(). With `breaks`, BREAK marks where a player that can
     insert silence should (between table rows); without, they are removed.
     """
+    # Lines cut by a narrow page (PDF copies) back into sentences, before
+    # anything reads a line edge as a pause
+    text = _unwrap_lines(text.replace('\r\n', '\n'))
     # ASCII arrows first: the HTML-tag pass would eat "<- a ->" as a tag.
     text = _RE_ASCII_ARROW.sub(PAUSE, text)
     # Tables — before pipe characters get turned into pauses, and before
