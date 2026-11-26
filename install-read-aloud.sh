@@ -32,7 +32,7 @@ fi
 echo "==> installing read-aloud helpers in $BIN_DIR"
 mkdir -p "$BIN_DIR"
 for f in edge-tts-stream speechify-tts-stream speak-selection.sh \
-         tts_proc.py tts_lang.py tts_text.py tts_fallback.py; do
+         tts_proc.py tts_lang.py tts_text.py tts_fallback.py tts_engine.py; do
     cp "$REPO_DIR/bin/$f" "$BIN_DIR/$f.new"
     mv -f "$BIN_DIR/$f.new" "$BIN_DIR/$f"   # never a half-written helper
 done
@@ -41,7 +41,7 @@ rm -f "$BIN_DIR/openai-tts-stream"
 # The Edge helper runs with the Python that has edge-tts.
 sed -i '' "1s|.*|#!$EDGE_PYTHON|" "$BIN_DIR/edge-tts-stream"
 chmod +x "$BIN_DIR/edge-tts-stream" "$BIN_DIR/speechify-tts-stream" \
-         "$BIN_DIR/speak-selection.sh"
+         "$BIN_DIR/speak-selection.sh" "$BIN_DIR/tts_engine.py"
 # A standby still holding the previous helper steps aside by itself; this
 # only saves it the wait.
 pkill -f "edge-tts-stream --standby" 2>/dev/null || true

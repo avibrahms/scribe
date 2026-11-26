@@ -83,6 +83,9 @@ from scribe_core import (
     save_voice,
     load_tts_engine,
     save_tts_engine,
+    save_tts_engine_for_lang,
+    effective_tts_engine,
+    resolve_tts_engine,
     load_speechify_voice,
     save_speechify_voice,
     speechify_voice_name,
@@ -103,7 +106,6 @@ from scribe_core import (
     load_speechify_voice_map,
     save_edge_voice_for_lang,
     save_speechify_voice_for_lang,
-    resolve_tts_voice,
     effective_tts_voice,
     sync_speak_settings,
     transcribe,
@@ -173,6 +175,10 @@ _TTS_STRAY_PATTERN = "|".join((
 # Both helpers explain a failed synthesis in one "[…-tts] reason" stderr line.
 _RE_TTS_HELPER_ERROR = re.compile(r"^\[(?:edge|speechify)-tts\] (.+)$", re.M)
 _TTS_ENGINE_NAMES = {"speechify": "Speechify", "edge": "Microsoft Edge"}
+_TTS_ENGINE_CHOICES = (
+    ("speechify", "Speechify · most natural"),
+    ("edge", "Microsoft Edge · free"),
+)
 
 
 def _tts_failure_reason(stderr_text: str, code: int) -> str:
@@ -792,16 +798,9 @@ class ScribeApp(rumps.App):
                 mi.state = 1
             self.hotkey_menu.add(mi)
 
-        # TTS engine picker (Speechify vs Microsoft Edge). Persisted choice.
-        self.engine_menu = rumps.MenuItem("TTS Engine")
-        for eng_id, eng_label in (
-            ("speechify", "Speechify · most natural"),
-            ("edge", "Microsoft Edge · free"),
-        ):
-            mi = rumps.MenuItem(eng_label, callback=self._make_engine_cb(eng_id))
-            if eng_id == self.tts_engine:
-                mi.state = 1
-            self.engine_menu.add(mi)
+        # TTS engine picker (Speechify vs Microsoft Edge): one per detected
+        # language, plus the default for everything else. Persisted choices.
+        self.engine_menu = self._build_engine_menu()
 
         # --- Speechify TTS: voice + every tunable, all in one submenu -----
         self.speechify_menu = rumps.MenuItem("Speechify TTS — tuning")
@@ -1107,16 +1106,46 @@ class ScribeApp(rumps.App):
             rumps.notification(f"{label} default voice", voice_id, "")
         return cb
 
-    def _make_engine_cb(self, engine_id: str):
-        def cb(sender: rumps.MenuItem) -> None:
-            for item in self.engine_menu.values():
-                item.state = 0
-            sender.state = 1
-            self.tts_engine = engine_id
-            save_tts_engine(engine_id)
-            label = "Speechify (most natural)" if engine_id == "speechify" \
-                else "Microsoft Edge (free)"
-            rumps.notification("TTS engine", label, "")
+    # -- engine picker (per detected language, plus the default) ----------
+
+    def _build_engine_menu(self) -> rumps.MenuItem:
+        menu = rumps.MenuItem("TTS Engine")
+        # (language or None for the default, engine, item): every check mark
+        # is re-derived from config in _refresh_engine_marks.
+        self._engine_items: list = []
+        rows = [(lang, TTS_LANG_LABELS.get(lang, lang)) for lang in TTS_LANGS]
+        rows.append((None, "Default — other or unclear language"))
+        for lang, title in rows:
+            if lang is None and len(rows) > 1:
+                menu.add(None)
+            sub = rumps.MenuItem(title)
+            for eng_id, eng_label in _TTS_ENGINE_CHOICES:
+                item = rumps.MenuItem(
+                    eng_label, callback=self._make_engine_cb(lang, eng_id))
+                sub.add(item)
+                self._engine_items.append((lang, eng_id, item))
+            menu.add(sub)
+        self._refresh_engine_marks()
+        return menu
+
+    def _refresh_engine_marks(self) -> None:
+        """Mark the engine each language will actually be read with: a
+        language never given its own engine shows the default one."""
+        for lang, eng_id, item in self._engine_items:
+            item.state = 1 if effective_tts_engine(lang) == eng_id else 0
+
+    def _make_engine_cb(self, lang: str | None, engine_id: str):
+        def cb(_sender: rumps.MenuItem) -> None:
+            if lang is None:
+                self.tts_engine = engine_id
+                save_tts_engine(engine_id)
+            else:
+                save_tts_engine_for_lang(lang, engine_id)
+            self._refresh_engine_marks()
+            where = TTS_LANG_LABELS.get(lang, lang) if lang else "default"
+            rumps.notification(
+                f"TTS engine — {where}",
+                _TTS_ENGINE_NAMES.get(engine_id, engine_id), "")
         return cb
 
     # -- generic "pick a value" submenu builder ---------------------------
@@ -1606,10 +1635,13 @@ class ScribeApp(rumps.App):
         self._speak_text(text)
 
     def _speak_text(self, text: str) -> None:
-        # Pick the backend by the persisted engine choice. If Speechify is
-        # selected but the key is missing, Edge reads instead, so Read aloud
+        # Pick the backend from the language of the text itself: the engine
+        # chosen for that language, else the default one (also when
+        # auto-detect is off or the detector is unsure). If Speechify is
+        # picked but the key is missing, Edge reads instead, so Read aloud
         # still works.
-        use_speechify = self.tts_engine == "speechify"
+        engine, lang = resolve_tts_engine(text)
+        use_speechify = engine == "speechify"
         if use_speechify and not speechify_api_key():
             callAfter(lambda: rumps.notification(
                 "Speechify key missing", "Falling back to Edge voice",
@@ -1624,13 +1656,12 @@ class ScribeApp(rumps.App):
             ))
             return
 
-        # Resolve the voice from the language of the text itself. Falls back
-        # to the engine's default voice when auto-detect is off, the detector
-        # is unsure, or that language has no voice mapped.
+        # The voice follows the same language: the user's pick for it, then
+        # the language's own voice, then the engine's default voice.
         engine = "speechify" if use_speechify else "edge"
-        voice, lang = resolve_tts_voice(engine, text)
+        voice = effective_tts_voice(engine, lang)
         if lang:
-            print(f"[tts] detected {lang} → {voice}", file=sys.stderr)
+            print(f"[tts] detected {lang} → {engine} · {voice}", file=sys.stderr)
 
         # Child inherits our env; for Speechify pass the key + chosen voice so
         # the helper needs no extra lookup. The voice also lives in
@@ -1795,11 +1826,12 @@ class ScribeApp(rumps.App):
         # previews the voice English actually speaks with, not whatever
         # happens to be the default.
         sample = "Notice how warm and natural this sounds."
-        if self.tts_engine == "speechify" and speechify_api_key():
-            voice, _ = resolve_tts_voice("speechify", sample)
+        engine, lang = resolve_tts_engine(sample)
+        if engine == "speechify" and speechify_api_key():
+            voice = effective_tts_voice("speechify", lang)
             self._speak_text(f"This is {speechify_voice_name(voice)}. {sample}")
             return
-        voice, _ = resolve_tts_voice("edge", sample)
+        voice = effective_tts_voice("edge", lang)
         name = voice.split("-")[-1].replace("Neural", "")
         self._speak_text(f"This is {name}. {sample}")
 

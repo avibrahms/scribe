@@ -32,7 +32,9 @@ Wispr Flow is great, but it's **$12/month**, proprietary, and sends your audio a
   - **Speechify** — `simba-3.5`: very natural voices, native to each language (Harper, Wyatt, Beatrice, Isabelle, Romain, …). Needs a Speechify API key (create one at platform.speechify.ai, set it via *Set Speechify API key…*); the free plan covers 333K characters a month and pauses until the next month once they are used.
   - **Microsoft Edge** (default) — free, unlimited Edge neural voices (Ava, Andrew, Brian, Emma, William, Sonia, Natasha, Denise, Elvira, Katja, Elsa, etc.), no API key.
 
-  The engine and per-engine voice are remembered across relaunch. Keys are stored only in the gitignored `.env` and a `0600` file under `~/.config/speak-selection/` — never committed.
+  The engine can differ by language: *TTS Engine* lists each language (English, French, Spanish, German, Italian) with its own engine choice — for example Edge for French and Speechify for English — plus *Default — other or unclear language* for everything else. A language never given its own engine follows the default, and the ⌃D/⌃X helpers pick the same engine as the app (`bin/tts_engine.py`).
+
+  The engines and per-engine voice are remembered across relaunch. Keys are stored only in the gitignored `.env` and a `0600` file under `~/.config/speak-selection/` — never committed.
 - **Per-language voices**: the language of the text is detected before it is spoken, and each language uses the voice you picked for it — Henri for French, William for English, and so on, per engine. Set them under *Voice* in either engine's tuning menu: pick a voice inside a language's submenu and the ✓ stays there. A language you never pick still gets its own default voice, so every language submenu always shows a ✓ on the voice it will actually use — on Edge that is a voice of the matching locale (Spanish text is read by a Spanish voice, never by whatever the global default happens to be), and on Speechify it is Speechify's first pick for that language. Only genuinely unidentifiable text falls through to *Default — when language is unclear*, and *Auto-detect language* turns the whole thing off.
 
   Detection is offline and dependency-free (`bin/tts_lang.py`) — no text is sent anywhere to identify it. It covers the languages Scribe ships voices for (English, French, Spanish, German, Italian) and deliberately answers "unsure" rather than guessing, in which case the default voice is used. The app and the standalone ⌃D/⌃X helpers share the one detector, so both pick the same voice for the same text. macOS only for now — the Windows tray app keeps the single-voice behaviour.
@@ -56,6 +58,7 @@ bin/tts_fallback.py       — fallbacks shared by the helpers (Mac voice, notifi
 bin/tts_text.py           — text preparation shared by the helpers (tables, symbols, units)
 bin/edge-tts-stream       — standalone Edge TTS helper (⌃D / ⌃X Quick Actions)
 bin/speechify-tts-stream  — standalone Speechify TTS helper
+bin/tts_engine.py         — picks the engine for a text's language (used by speak-selection.sh)
 bin/speak-selection.sh    — routes the Quick Actions to the selected engine
 setup.py                  — macOS .app build recipe (py2app)
 install.sh                — macOS installer

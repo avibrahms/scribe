@@ -324,3 +324,14 @@ def voice_for_lang(mapping, lang, default, lang_defaults=None):
     if isinstance(lang_defaults, dict) and lang_defaults.get(lang):
         return lang_defaults[lang]
     return default
+
+
+def engine_for_lang(mapping, lang, default):
+    """Pick the engine ("edge", "speechify") that reads `lang`: the one the
+    user chose for this language, else the default engine.
+
+    Shared by the app and the hotkey launcher so the rule cannot drift.
+    """
+    if lang and isinstance(mapping, dict) and mapping.get(lang):
+        return mapping[lang]
+    return default

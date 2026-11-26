@@ -59,6 +59,30 @@ class VoiceStoreTest(unittest.TestCase):
         self.assertEqual(core.effective_tts_voice("speechify", "de"), "henrik-agent")
         self.assertEqual(core.effective_tts_voice("speechify", None), "wyatt_32")
 
+    def test_each_language_can_have_its_own_engine(self):
+        core.save_tts_engine("edge")
+        core.save_tts_engine_for_lang("en", "speechify")
+        core.save_tts_engine_for_lang("fr", "openai")  # unknown: ignored
+        mirror = json.loads(core.SETTINGS_FILE.read_text())
+        self.assertEqual(mirror["engine"], "edge")
+        self.assertEqual(mirror["engine_by_lang"], {"en": "speechify"})
+        self.assertEqual(core.effective_tts_engine("en"), "speechify")
+        self.assertEqual(core.effective_tts_engine("fr"), "edge")
+        self.assertEqual(core.effective_tts_engine(None), "edge")
+        english = "This is the text that we would like to hear, and it is in English."
+        french = "Voici le texte que nous voulons entendre, et il est en français."
+        self.assertEqual(core.resolve_tts_engine(english), ("speechify", "en"))
+        self.assertEqual(core.resolve_tts_engine(french), ("edge", "fr"))
+        # The hotkey launcher picks the same engine from the mirror.
+        sys.path.insert(0, str(Path(core.__file__).parent / "bin"))
+        import tts_engine
+        self.assertEqual(tts_engine.pick_engine(english, mirror), "speechify")
+        self.assertEqual(tts_engine.pick_engine(french, mirror), "edge")
+        core.save_tts_autodetect(False)
+        self.assertEqual(core.resolve_tts_engine(english), ("edge", None))
+        mirror = json.loads(core.SETTINGS_FILE.read_text())
+        self.assertEqual(tts_engine.pick_engine(english, mirror), "edge")
+
     def test_openai_settings_are_dropped_and_the_speed_kept(self):
         core.CONFIG_FILE.write_text(json.dumps(
             {"edge_voice": "fr-FR-HenriNeural", "tts_engine": "openai",

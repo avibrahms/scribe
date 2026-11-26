@@ -1,25 +1,34 @@
 #!/bin/bash
 # Speak selected / clipboard text using the engine selected in Scribe.
 #
-# Reads the active engine from ~/.config/speak-selection/settings.json
-# ("engine": "speechify" | "edge") so the global hotkey matches whatever you
-# picked in the Scribe menu. Edge, the free one, speaks unless Speechify was
+# Reads the engines from ~/.config/speak-selection/settings.json ("engine":
+# the default, "engine_by_lang": one per language; "speechify" | "edge") so
+# the global hotkey matches whatever you picked in the Scribe menu for the
+# language of the text. Edge, the free one, speaks unless Speechify was
 # picked there, and whenever Speechify is unavailable.
 #
 # Triggered via the "Speak Selection" Quick Action (⌃D) and the clipboard
 # one (⌃X). Accepts the text as $1, on stdin (--stdin), or from the clipboard.
 
-SETTINGS="$HOME/.config/speak-selection/settings.json"
 KEY_FILE="$HOME/.config/speak-selection/speechify_key"
 EDGE="$HOME/bin/edge-tts-stream"
 SPEECHIFY="$HOME/bin/speechify-tts-stream"
+PICK_ENGINE="$HOME/bin/tts_engine.py"
+
+# --- gather text -----------------------------------------------------------
+if [ "$1" = "--stdin" ]; then
+    TEXT="$(cat)"
+elif [ -n "$1" ]; then
+    TEXT="$1"
+else
+    TEXT="$(pbpaste)"
+fi
+[ -z "$TEXT" ] && exit 0
 
 # --- pick engine (default edge) -------------------------------------------
-ENGINE="edge"
-if [ -f "$SETTINGS" ]; then
-    E=$(sed -n 's/.*"engine"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$SETTINGS" | head -1)
-    [ -n "$E" ] && ENGINE="$E"
-fi
+# The engine chosen in the Scribe menu for the language of this text, else
+# the default one. Edge, the free one, whenever the picker says nothing.
+ENGINE="$(printf '%s' "$TEXT" | "$PICK_ENGINE" 2>/dev/null)"
 
 if [ "$ENGINE" != "speechify" ]; then
     HELPER="$EDGE"
@@ -31,16 +40,6 @@ else
         HELPER="$EDGE"
     fi
 fi
-
-# --- gather text -----------------------------------------------------------
-if [ "$1" = "--stdin" ]; then
-    TEXT="$(cat)"
-elif [ -n "$1" ]; then
-    TEXT="$1"
-else
-    TEXT="$(pbpaste)"
-fi
-[ -z "$TEXT" ] && exit 0
 
 # The helpers stop any current playback themselves, read their voice
 # from settings.json, and clean up. When synthesis fails they exit 1 with a

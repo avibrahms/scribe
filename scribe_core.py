@@ -327,7 +327,8 @@ def save_voice(voice: str) -> None:
 
 
 # ---------- TTS engine selection (Edge vs Speechify) ---------------------
-# Two backends, switchable from the menu, choice persisted across relaunch.
+# Two backends, switchable from the menu, choice persisted across relaunch:
+# a default engine, and optionally one per detected language.
 #   • "edge"      — free Microsoft Edge neural voices (no key, see VOICES)
 #   • "speechify" — simba-3.5, the most natural voices (needs a key; the free
 #                   plan covers 333K characters a month)
@@ -417,6 +418,44 @@ def save_tts_engine(engine: str) -> None:
     cfg["tts_engine"] = engine
     save_cfg(cfg)
     _write_speak_settings(engine=engine)
+
+
+def load_tts_engine_map() -> dict[str, str]:
+    """{language: engine} for the languages given an engine of their own."""
+    raw = load_cfg().get("tts_engine_by_lang")
+    if not isinstance(raw, dict):
+        return {}
+    return {str(k): v for k, v in raw.items()
+            if k in TTS_LANGS and v in TTS_ENGINES}
+
+
+def save_tts_engine_for_lang(lang: str, engine: str) -> None:
+    engine = engine.strip().lower()
+    if lang not in TTS_LANGS or engine not in TTS_ENGINES:
+        return
+    mapping = load_tts_engine_map()
+    mapping[lang] = engine
+    cfg = load_cfg()
+    cfg["tts_engine_by_lang"] = mapping
+    save_cfg(cfg)
+    _write_speak_settings(engine_by_lang=mapping)
+
+
+def effective_tts_engine(lang: str | None) -> str:
+    """Engine that text of language `lang` is read with: the one chosen for
+    that language, else the default engine. Shared by the speak path and the
+    menu's check marks."""
+    mapping, default = load_tts_engine_map(), load_tts_engine()
+    if tts_lang:
+        return tts_lang.engine_for_lang(mapping, lang, default)
+    return (mapping.get(lang) if lang else None) or default
+
+
+def resolve_tts_engine(text: str) -> tuple[str, str | None]:
+    """(engine, detected_lang) for speaking `text`. Auto-detect off or an
+    unsure detector end at the default engine."""
+    lang = detect_tts_language(text) if load_tts_autodetect() else None
+    return effective_tts_engine(lang), lang
 
 
 def load_speechify_voice() -> str:
@@ -684,6 +723,7 @@ def sync_speak_settings() -> None:
     _drop_openai_settings()
     _write_speak_settings(
         engine=load_tts_engine(),
+        engine_by_lang=load_tts_engine_map(),
         voice=load_voice(),
         rate=load_edge_rate(),
         pitch=load_edge_pitch(),
